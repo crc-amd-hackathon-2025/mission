@@ -4,7 +4,13 @@
 
 ## Team Information
 
-**Team:** *Your team number, name of your team, and members*
+**Team:**
+- ID: 1
+- Name: CRC
+- Members:
+    - Cedric
+    - Remy
+    - Clement
 
 **Summary:** *A brief description of your work*
 
