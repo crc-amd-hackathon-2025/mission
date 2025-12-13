@@ -1,0 +1,5 @@
+mission/code/outputs/
+.vscode/
+*.ts
+*.pt
+.venv/
