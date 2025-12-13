@@ -893,7 +893,7 @@ def yolo_loop(model: YOLO, cap, class_ids: List[int], shared: SharedState):
 
                 if did_move:
                     with shared.lock:
-                        shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] - delta_pan_deg)
+                        shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] - 0.15 * delta_pan_deg)
 
                         shared.current_y = float(shared.current_y + delta_y_m)
                         j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
