@@ -1,82 +1,76 @@
 #!/usr/bin/env python3
-"""
-SO101: Keyboard EE control + YOLO display, with optional YOLO follow (toggle with 'p').
+# -*- coding: utf-8 -*-
 
-Requested behavior:
-- Default: YOLO only displays detections, no robot control from vision.
-- Press 'p' to toggle YOLO follow ON/OFF.
-- Console prints only on events:
-  - key press that changes something
-  - follow actually applies a non-zero movement
-- Default inputs:
-    port = /dev/ttyACM1
-    robot_id = SO101_follower
+"""
+SO101: Keyboard + YOLO11x (COCO) display, optional follow with calibration and persistent settings.
+
+Keys:
+- ESC: quit (both in YOLO window and keyboard teleop)
+- p: toggle follow ON/OFF (default OFF)
+- c: auto-calibrate follow (hold the target visible, ideally near center)
+- k: edit CONTROL_FREQ, KP, EE_STEP, PITCH_STEP
+- Digits 0..9: select memory slot
+- o: store current pose to selected slot
+- i: go to selected slot
+
+Manual joint controls:
+- q/a: shoulder_pan -/+
+- t/g: wrist_roll -/+
+- y/h: gripper close/open
+- r/f: pitch +/-
+
+EE controls:
+- Left/Right arrow: x -/+
+- Up/Down arrow: y -/+
+
+Notes:
+- Uses LeRobot SO101 follower in degrees (use_degrees=True).
+- YOLO is COCO with yolo11x.pt.
 """
 
+import os
+import json
 import time
 import math
 import cv2
 import threading
 import traceback
 import logging
-from ultralytics import YOLOE
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, Tuple, List
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("so101_yolo_follow")
+# -----------------------------
+# Silence Ultralytics console logs
+# -----------------------------
+os.environ.setdefault("YOLO_VERBOSE", "False")
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+logging.getLogger("ultralytics.utils").setLevel(logging.ERROR)
 
-# =========================
-# Tuning knobs (safe-ish defaults)
-# =========================
+from ultralytics import YOLO  # noqa: E402
 
-CONTROL_FREQ = 20
-KP = 0.3
 
-# Keyboard EE step (meters)
-EE_STEP = 0.004
+# -----------------------------
+# Persistent settings file
+# -----------------------------
+SETTINGS_PATH = "so101_yolo_follow_settings.json"
+SETTINGS_VERSION = 1
 
-# Pitch adjustment (degrees per keypress)
-PITCH_STEP = 1.0
 
-# Follow gains:
-# Use normalized offsets: dx_norm, dy_norm in [-1, 1]
-K_PAN_RAD_PER_NORM = -0.35   # rad per normalized horizontal offset
-K_Y_M_PER_NORM = 0.02       # meters per normalized vertical offset
+# -----------------------------
+# COCO aliases (user-friendly)
+# -----------------------------
+COCO_ALIAS = {
+    "human": "person",
+    "man": "person",
+    "woman": "person",
+    "cellphone": "cell phone",
+}
 
-# Follow deadzones on normalized offsets
-PAN_DEADZONE_NORM = 0.10
-Y_DEADZONE_NORM = 0.06
 
-# Clamp follow deltas per frame
-PAN_MAX_DEG_PER_FRAME = 3.0
-Y_MAX_M_PER_FRAME = 0.005
-
-# If you want a bit of extra manual trim (usually keep OFF with use_degrees=True)
-APPLY_FINE_TRIM = False
-JOINT_FINE_TRIM = [
-    ["shoulder_pan", 0.0, 1.0],
-    ["shoulder_lift", 0.0, 1.0],
-    ["elbow_flex", 0.0, 1.0],
-    ["wrist_flex", 0.0, 1.0],
-    ["wrist_roll", 0.0, 1.0],
-    ["gripper", 0.0, 1.0],
-]
-
-def apply_fine_trim(joint_name: str, deg_value: float) -> float:
-    if not APPLY_FINE_TRIM:
-        return float(deg_value)
-    for name, offset, scale in JOINT_FINE_TRIM:
-        if name == joint_name:
-            return (float(deg_value) + float(offset)) * float(scale)
-    return float(deg_value)
-
-# =========================
-# Simple planar IK (your original convention)
-# =========================
+# -----------------------------
+# Planar IK (same as your original)
+# -----------------------------
 def inverse_kinematics_2d(x, y, l1=0.1159, l2=0.1350):
-    """
-    2-link planar IK used in your SO100 script.
-    Returns (joint2_deg, joint3_deg) in your original degree convention.
-    """
     theta1_offset = math.atan2(0.028, 0.11257)
     theta2_offset = math.atan2(0.0052, 0.1349) + theta1_offset
 
@@ -107,7 +101,6 @@ def inverse_kinematics_2d(x, y, l1=0.1159, l2=0.1350):
     joint2 = theta1 + theta1_offset
     joint3 = theta2 + theta2_offset
 
-    # These clamps are from your original; they may not match SO101 URDF exactly
     joint2 = max(-0.1, min(3.45, joint2))
     joint3 = max(-0.2, min(math.pi, joint3))
 
@@ -119,88 +112,192 @@ def inverse_kinematics_2d(x, y, l1=0.1159, l2=0.1350):
 
     return joint2_deg, joint3_deg
 
-# =========================
-# Motion helpers
-# =========================
-def move_to_zero_position(robot, stop_event: threading.Event, duration=3.0, kp=0.5, control_freq=CONTROL_FREQ):
-    zero_positions = {
-        "shoulder_pan": 0.0,
-        "shoulder_lift": 0.0,
-        "elbow_flex": 0.0,
-        "wrist_flex": 0.0,
-        "wrist_roll": 0.0,
-        "gripper": 0.0,
-    }
 
-    total_steps = int(duration * control_freq)
-    step_time = 1.0 / control_freq
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-    for _ in range(total_steps):
-        if stop_event.is_set():
-            return
 
-        obs = robot.get_observation()
-        current_positions = {}
-        for k, v in obs.items():
-            if k.endswith(".pos"):
-                name = k.removesuffix(".pos")
-                current_positions[name] = apply_fine_trim(name, float(v))
+def now_ts() -> float:
+    return time.time()
 
-        action = {}
-        for j, target in zero_positions.items():
-            if j in current_positions:
-                cur = current_positions[j]
-                err = target - cur
-                action[f"{j}.pos"] = float(cur + kp * err)
 
-        if action:
-            robot.send_action(action)
+# -----------------------------
+# Settings schema
+# -----------------------------
+@dataclass
+class FollowGains:
+    pan_deg_per_norm: float = -2.0   # delta_pan_deg = gain * dx_norm
+    y_m_per_norm: float = -0.01      # delta_y_m = gain * dy_norm
+    calibrated: bool = False
 
-        time.sleep(step_time)
+@dataclass
+class ControlParams:
+    control_freq: int = 20
+    kp: float = 0.3
+    ee_step: float = 0.004
+    pitch_step: float = 1.0
 
-def return_to_start_position(robot, stop_event: threading.Event, start_positions, kp=0.2, control_freq=CONTROL_FREQ):
-    control_period = 1.0 / control_freq
-    max_steps = int(5.0 * control_freq)
+@dataclass
+class YoloParams:
+    model_path: str = "yolo11x.pt"
+    imgsz: int = 960
+    conf: float = 0.15
+    iou: float = 0.7
+    target_objects: List[str] = None
+    camera_index: Optional[int] = None
 
-    for _ in range(max_steps):
-        if stop_event.is_set():
-            # still try to go home a bit, but don't block forever
+    def __post_init__(self):
+        if self.target_objects is None:
+            self.target_objects = ["cup"]
+
+@dataclass
+class FollowParams:
+    deadzone_x: float = 0.06
+    deadzone_y: float = 0.05
+    pan_max_deg_per_frame: float = 3.0
+    y_max_m_per_frame: float = 0.005
+    calibration_fraction: float = 0.6
+    calibration_pan_step_deg: float = 2.0
+    calibration_y_step_m: float = 0.004
+    calibration_settle_frames: int = 8
+
+@dataclass
+class SavedPose:
+    joints_deg: Dict[str, float]
+    current_x: float
+    current_y: float
+    pitch: float
+    timestamp: float
+
+@dataclass
+class AppSettings:
+    version: int = SETTINGS_VERSION
+    control: ControlParams = ControlParams()
+    yolo: YoloParams = YoloParams()
+    follow: FollowParams = FollowParams()
+    gains: FollowGains = FollowGains()
+    poses: Dict[str, SavedPose] = None
+
+    def __post_init__(self):
+        if self.poses is None:
+            self.poses = {}
+
+
+def _dict_to_dataclass(settings_dict: Dict[str, Any]) -> AppSettings:
+    # Robust-ish loader with defaults
+    s = AppSettings()
+
+    try:
+        if int(settings_dict.get("version", SETTINGS_VERSION)) != SETTINGS_VERSION:
+            # If version mismatch, just try best-effort merge
             pass
+    except Exception:
+        pass
 
-        obs = robot.get_observation()
-        current_positions = {}
-        for k, v in obs.items():
-            if k.endswith(".pos"):
-                name = k.removesuffix(".pos")
-                current_positions[name] = float(v)
+    # control
+    c = settings_dict.get("control", {})
+    s.control.control_freq = int(c.get("control_freq", s.control.control_freq))
+    s.control.kp = float(c.get("kp", s.control.kp))
+    s.control.ee_step = float(c.get("ee_step", s.control.ee_step))
+    s.control.pitch_step = float(c.get("pitch_step", s.control.pitch_step))
 
-        action = {}
-        total_err = 0.0
-        for j, target in start_positions.items():
-            if j in current_positions:
-                cur = current_positions[j]
-                err = float(target) - float(cur)
-                total_err += abs(err)
-                action[f"{j}.pos"] = float(cur + kp * err)
+    # yolo
+    y = settings_dict.get("yolo", {})
+    s.yolo.model_path = str(y.get("model_path", s.yolo.model_path))
+    s.yolo.imgsz = int(y.get("imgsz", s.yolo.imgsz))
+    s.yolo.conf = float(y.get("conf", s.yolo.conf))
+    s.yolo.iou = float(y.get("iou", s.yolo.iou))
+    s.yolo.target_objects = list(y.get("target_objects", s.yolo.target_objects or ["cup"]))
+    s.yolo.camera_index = y.get("camera_index", s.yolo.camera_index)
+    if s.yolo.camera_index is not None:
+        try:
+            s.yolo.camera_index = int(s.yolo.camera_index)
+        except Exception:
+            s.yolo.camera_index = None
 
-        if action:
-            robot.send_action(action)
+    # follow params
+    fp = settings_dict.get("follow", {})
+    s.follow.deadzone_x = float(fp.get("deadzone_x", s.follow.deadzone_x))
+    s.follow.deadzone_y = float(fp.get("deadzone_y", s.follow.deadzone_y))
+    s.follow.pan_max_deg_per_frame = float(fp.get("pan_max_deg_per_frame", s.follow.pan_max_deg_per_frame))
+    s.follow.y_max_m_per_frame = float(fp.get("y_max_m_per_frame", s.follow.y_max_m_per_frame))
+    s.follow.calibration_fraction = float(fp.get("calibration_fraction", s.follow.calibration_fraction))
+    s.follow.calibration_pan_step_deg = float(fp.get("calibration_pan_step_deg", s.follow.calibration_pan_step_deg))
+    s.follow.calibration_y_step_m = float(fp.get("calibration_y_step_m", s.follow.calibration_y_step_m))
+    s.follow.calibration_settle_frames = int(fp.get("calibration_settle_frames", s.follow.calibration_settle_frames))
 
-        if total_err < 2.0:
-            return
+    # gains
+    g = settings_dict.get("gains", {})
+    s.gains.pan_deg_per_norm = float(g.get("pan_deg_per_norm", s.gains.pan_deg_per_norm))
+    s.gains.y_m_per_norm = float(g.get("y_m_per_norm", s.gains.y_m_per_norm))
+    s.gains.calibrated = bool(g.get("calibrated", s.gains.calibrated))
 
-        time.sleep(control_period)
+    # poses
+    poses = settings_dict.get("poses", {}) or {}
+    s.poses = {}
+    for k, v in poses.items():
+        try:
+            s.poses[str(k)] = SavedPose(
+                joints_deg=dict(v.get("joints_deg", {})),
+                current_x=float(v.get("current_x", 0.1629)),
+                current_y=float(v.get("current_y", 0.1131)),
+                pitch=float(v.get("pitch", 0.0)),
+                timestamp=float(v.get("timestamp", now_ts())),
+            )
+        except Exception:
+            continue
 
-# =========================
-# Shared state
-# =========================
+    return s
+
+
+def load_settings(path: str) -> AppSettings:
+    if not os.path.exists(path):
+        return AppSettings()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _dict_to_dataclass(data if isinstance(data, dict) else {})
+    except Exception:
+        return AppSettings()
+
+
+def save_settings(path: str, settings: AppSettings) -> None:
+    try:
+        # Convert dataclasses safely
+        out = {
+            "version": SETTINGS_VERSION,
+            "control": asdict(settings.control),
+            "yolo": asdict(settings.yolo),
+            "follow": asdict(settings.follow),
+            "gains": asdict(settings.gains),
+            "poses": {k: asdict(v) for k, v in settings.poses.items()},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
+    except Exception:
+        # Stay silent to respect "prints only on events"
+        pass
+
+
+# -----------------------------
+# Shared runtime state
+# -----------------------------
 class SharedState:
-    def __init__(self):
+    def __init__(self, settings: AppSettings):
         self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+
+        self.settings = settings
+
+        # follow toggle (default OFF)
         self.follow_enabled = False
+
+        # EE state (2D)
         self.current_x = 0.1629
         self.current_y = 0.1131
         self.pitch = 0.0
+
+        # target joint positions (degrees)
         self.target_positions = {
             "shoulder_pan": 0.0,
             "shoulder_lift": 0.0,
@@ -210,105 +307,418 @@ class SharedState:
             "gripper": 0.0,
         }
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+        # latest detection for follow/calibration
+        self.last_frame_shape: Optional[Tuple[int, int]] = None
+        self.last_best_box: Optional[Tuple[float, float, float, float]] = None
+        self.last_best_conf: Optional[float] = None
 
-# =========================
-# YOLO display + optional follow
-# =========================
-def yolo_loop(model, cap, robot, stop_event: threading.Event, shared: SharedState):
-    """
-    Always displays detections.
-    If follow_enabled is True, it updates target_positions based on bbox center offset.
-    """
+        # pose slot selection
+        self.selected_slot: str = "1"
+
+    def sync_from_saved_pose(self, pose: SavedPose):
+        self.current_x = float(pose.current_x)
+        self.current_y = float(pose.current_y)
+        self.pitch = float(pose.pitch)
+        # copy targets for main joints; wrist_flex will be recomputed from pitch
+        for k, v in pose.joints_deg.items():
+            if k in self.target_positions:
+                self.target_positions[k] = float(v)
+
+    def snapshot_pose(self, joints_deg: Dict[str, float]) -> SavedPose:
+        return SavedPose(
+            joints_deg=dict(joints_deg),
+            current_x=float(self.current_x),
+            current_y=float(self.current_y),
+            pitch=float(self.pitch),
+            timestamp=now_ts(),
+        )
+
+
+# -----------------------------
+# YOLO helpers
+# -----------------------------
+def normalize_target_names(names: List[str]) -> List[str]:
+    out = []
+    for n in names:
+        t = str(n).strip().lower()
+        if not t:
+            continue
+        out.append(COCO_ALIAS.get(t, t))
+    return out
+
+
+def get_class_ids_from_names(model: YOLO, names: List[str]) -> List[int]:
+    # model.names: dict id->name
+    name_to_id = {str(v).lower(): int(k) for k, v in model.names.items()}
+    ids = []
+    for n in names:
+        if n in name_to_id:
+            ids.append(name_to_id[n])
+    return ids
+
+
+def pick_best_box(result0) -> Tuple[Optional[Tuple[float, float, float, float]], Optional[float]]:
+    boxes = result0.boxes
+    if boxes is None or len(boxes) == 0:
+        return None, None
+    confs = boxes.conf
+    xyxy = boxes.xyxy
+    idx = int(confs.argmax().item())
+    box = xyxy[idx].tolist()
+    conf = float(confs[idx].item())
+    return (float(box[0]), float(box[1]), float(box[2]), float(box[3])), conf
+
+
+def box_center_norm(box: Tuple[float, float, float, float], frame_shape) -> Tuple[float, float]:
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = box
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    dx_norm = (cx - (w * 0.5)) / (w * 0.5)
+    dy_norm = (cy - (h * 0.5)) / (h * 0.5)
+    return dx_norm, dy_norm
+
+
+# -----------------------------
+# Follow calibration (key 'c')
+# -----------------------------
+def wait_for_new_boxes(shared: SharedState, n: int, timeout_s: float = 2.5) -> bool:
+    got = 0
+    last = None
+    t0 = now_ts()
+    while got < n and (now_ts() - t0) < timeout_s and not shared.stop_event.is_set():
+        with shared.lock:
+            b = shared.last_best_box
+        if b is not None and b != last:
+            last = b
+            got += 1
+        time.sleep(0.02)
+    return got >= n
+
+
+def run_follow_calibration(robot, shared: SharedState) -> None:
+    # Event function: prints are allowed here
+    with shared.lock:
+        box0 = shared.last_best_box
+        shape0 = shared.last_frame_shape
+        pan_step_deg = float(shared.settings.follow.calibration_pan_step_deg)
+        y_step_m = float(shared.settings.follow.calibration_y_step_m)
+        settle_frames = int(shared.settings.follow.calibration_settle_frames)
+        frac = float(shared.settings.follow.calibration_fraction)
+
+    if box0 is None or shape0 is None:
+        print("[CAL] pas de détection dispo. Mets l'objet dans le champ et relance 'c'.")
+        return
+
+    base_dx, base_dy = box_center_norm(box0, (shape0[0], shape0[1], 3))
+
+    # PAN impulse
+    with shared.lock:
+        shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] + pan_step_deg)
+    if not wait_for_new_boxes(shared, settle_frames):
+        with shared.lock:
+            shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] - pan_step_deg)
+        print("[CAL] détection perdue pendant le pas pan.")
+        return
+
+    with shared.lock:
+        b1 = shared.last_best_box
+        s1 = shared.last_frame_shape
+    if b1 is None or s1 is None:
+        with shared.lock:
+            shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] - pan_step_deg)
+        print("[CAL] détection invalide pendant pan.")
+        return
+
+    dx1, dy1 = box_center_norm(b1, (s1[0], s1[1], 3))
+    delta_dx = dx1 - base_dx
+
+    # Revert pan
+    with shared.lock:
+        shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] - pan_step_deg)
+
+    # Y impulse
+    with shared.lock:
+        shared.current_y = float(shared.current_y + y_step_m)
+        j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+        shared.target_positions["shoulder_lift"] = float(j2)
+        shared.target_positions["elbow_flex"] = float(j3)
+
+    if not wait_for_new_boxes(shared, settle_frames):
+        with shared.lock:
+            shared.current_y = float(shared.current_y - y_step_m)
+            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+            shared.target_positions["shoulder_lift"] = float(j2)
+            shared.target_positions["elbow_flex"] = float(j3)
+        print("[CAL] détection perdue pendant le pas y.")
+        return
+
+    with shared.lock:
+        b2 = shared.last_best_box
+        s2 = shared.last_frame_shape
+    if b2 is None or s2 is None:
+        with shared.lock:
+            shared.current_y = float(shared.current_y - y_step_m)
+            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+            shared.target_positions["shoulder_lift"] = float(j2)
+            shared.target_positions["elbow_flex"] = float(j3)
+        print("[CAL] détection invalide pendant y.")
+        return
+
+    dx2, dy2 = box_center_norm(b2, (s2[0], s2[1], 3))
+    delta_dy = dy2 - base_dy
+
+    # Revert y
+    with shared.lock:
+        shared.current_y = float(shared.current_y - y_step_m)
+        j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+        shared.target_positions["shoulder_lift"] = float(j2)
+        shared.target_positions["elbow_flex"] = float(j3)
+
+    eps = 1e-6
+    ok_pan = abs(delta_dx) > eps
+    ok_y = abs(delta_dy) > eps
+
+    with shared.lock:
+        if ok_pan:
+            shared.settings.gains.pan_deg_per_norm = -(frac * pan_step_deg / delta_dx)
+        if ok_y:
+            shared.settings.gains.y_m_per_norm = -(frac * y_step_m / delta_dy)
+        shared.settings.gains.calibrated = bool(ok_pan and ok_y)
+        gp = shared.settings.gains.pan_deg_per_norm
+        gy = shared.settings.gains.y_m_per_norm
+        cal = shared.settings.gains.calibrated
+
+    save_settings(SETTINGS_PATH, shared.settings)
+
+    print(f"[CAL] delta_dx={delta_dx:+.3f} pour {pan_step_deg:+.2f}deg, delta_dy={delta_dy:+.3f} pour {y_step_m:+.4f}m")
+    print(f"[CAL] gains: pan_deg_per_norm={gp:+.2f}, y_m_per_norm={gy:+.4f}, calibrated={cal}")
+
+
+# -----------------------------
+# Pose storing and goto
+# -----------------------------
+def read_joint_positions_deg(robot) -> Dict[str, float]:
+    obs = robot.get_observation()
+    joints = {}
+    for k, v in obs.items():
+        if k.endswith(".pos"):
+            j = k.removesuffix(".pos")
+            joints[j] = float(v)
+    return joints
+
+
+def goto_pose_blocking(robot, shared: SharedState, target: SavedPose, timeout_s: float = 6.0, threshold_deg: float = 2.0) -> None:
+    # Event function: prints are allowed here
+    # Temporarily disable follow during goto
+    with shared.lock:
+        follow_prev = shared.follow_enabled
+        shared.follow_enabled = False
+        shared.sync_from_saved_pose(target)
+
+    t0 = now_ts()
+    while (now_ts() - t0) < timeout_s and not shared.stop_event.is_set():
+        with shared.lock:
+            kp = float(shared.settings.control.kp)
+            cf = int(shared.settings.control.control_freq)
+            pitch = float(shared.pitch)
+            # enforce wrist_flex rule
+            shared.target_positions["wrist_flex"] = (
+                -float(shared.target_positions["shoulder_lift"])
+                -float(shared.target_positions["elbow_flex"])
+                + pitch
+            )
+            targets = dict(shared.target_positions)
+
+        obs = robot.get_observation()
+        cur = {}
+        for k, v in obs.items():
+            if k.endswith(".pos"):
+                j = k.removesuffix(".pos")
+                cur[j] = float(v)
+
+        action = {}
+        total_err = 0.0
+        for j, tgt in targets.items():
+            if j in cur:
+                err = float(tgt) - float(cur[j])
+                total_err += abs(err)
+                action[f"{j}.pos"] = float(cur[j] + kp * err)
+
+        if action:
+            robot.send_action(action)
+
+        if total_err < threshold_deg:
+            break
+
+        time.sleep(1.0 / max(1, cf))
+
+    with shared.lock:
+        shared.follow_enabled = follow_prev
+
+
+def store_pose(shared: SharedState, slot: str, joints_deg: Dict[str, float]) -> None:
+    pose = shared.snapshot_pose(joints_deg)
+    shared.settings.poses[str(slot)] = pose
+    save_settings(SETTINGS_PATH, shared.settings)
+
+
+# -----------------------------
+# Manual tuning menu (key 'k')
+# -----------------------------
+def tune_params_interactive(shared: SharedState) -> None:
+    # Event function: prints are allowed here
+    with shared.lock:
+        c = shared.settings.control
+
+    print("[TUNE] paramètres actuels:")
+    print(f"  CONTROL_FREQ = {c.control_freq}")
+    print(f"  KP = {c.kp}")
+    print(f"  EE_STEP = {c.ee_step}")
+    print(f"  PITCH_STEP = {c.pitch_step}")
+    print("[TUNE] entre une valeur ou laisse vide pour garder")
+
+    def ask_int(name: str, cur: int) -> int:
+        s = input(f"{name} [{cur}]: ").strip()
+        if not s:
+            return cur
+        return int(s)
+
+    def ask_float(name: str, cur: float) -> float:
+        s = input(f"{name} [{cur}]: ").strip()
+        if not s:
+            return cur
+        return float(s)
+
+    try:
+        new_freq = ask_int("CONTROL_FREQ", c.control_freq)
+        new_kp = ask_float("KP", c.kp)
+        new_ee = ask_float("EE_STEP", c.ee_step)
+        new_pitch = ask_float("PITCH_STEP", c.pitch_step)
+    except Exception:
+        print("[TUNE] entrée invalide, aucun changement")
+        return
+
+    with shared.lock:
+        shared.settings.control.control_freq = max(1, int(new_freq))
+        shared.settings.control.kp = float(new_kp)
+        shared.settings.control.ee_step = float(new_ee)
+        shared.settings.control.pitch_step = float(new_pitch)
+
+    save_settings(SETTINGS_PATH, shared.settings)
+    print("[TUNE] ok, enregistré")
+
+
+# -----------------------------
+# YOLO thread
+# -----------------------------
+def yolo_loop(model: YOLO, cap, class_ids: List[int], shared: SharedState):
     last_follow_print_ts = 0.0
 
-    while not stop_event.is_set():
+    while not shared.stop_event.is_set():
         try:
             ret, frame = cap.read()
             if not ret:
                 time.sleep(0.01)
                 continue
 
-            results = model(frame)
-            annotated = frame
-            best_box = None
-
-            if results and hasattr(results[0], "boxes") and results[0].boxes is not None and len(results[0].boxes) > 0:
-                annotated = results[0].plot()
-
-                # pick largest box (stable heuristic)
-                boxes_xyxy = results[0].boxes.xyxy
-                areas = (boxes_xyxy[:, 2] - boxes_xyxy[:, 0]) * (boxes_xyxy[:, 3] - boxes_xyxy[:, 1])
-                idx = int(areas.argmax().item())
-                best_box = boxes_xyxy[idx].tolist()
-
-            cv2.imshow("YOLO Live Detection", annotated)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:
-                stop_event.set()
-                break
-
-            # Follow logic
             with shared.lock:
+                yp = shared.settings.yolo
+                fp = shared.settings.follow
+                gains = shared.settings.gains
                 follow_on = shared.follow_enabled
 
+            results = model.predict(
+                source=frame,
+                imgsz=int(yp.imgsz),
+                conf=float(yp.conf),
+                iou=float(yp.iou),
+                classes=class_ids if class_ids else None,
+                verbose=False,
+            )
+
+            annotated = frame
+            best_box = None
+            best_conf = None
+
+            if results and len(results) > 0:
+                r0 = results[0]
+                # annotated plot (no prints)
+                try:
+                    annotated = r0.plot()
+                except Exception:
+                    annotated = frame
+                best_box, best_conf = pick_best_box(r0)
+
+            with shared.lock:
+                shared.last_frame_shape = frame.shape[:2]
+                shared.last_best_box = best_box
+                shared.last_best_conf = best_conf
+
+            # Follow control: center object in frame
             if follow_on and best_box is not None:
-                x1, y1, x2, y2 = best_box
-                h, w = frame.shape[:2]
-                cx = 0.5 * (x1 + x2)
-                cy = 0.5 * (y1 + y2)
+                dx_norm, dy_norm = box_center_norm(best_box, frame.shape)
 
-                dx_norm = (cx - (w * 0.5)) / (w * 0.5)
-                dy_norm = (cy - (h * 0.5)) / (h * 0.5)
-
-                # Deadzones
-                if abs(dx_norm) < PAN_DEADZONE_NORM:
+                if abs(dx_norm) < float(fp.deadzone_x):
                     dx_norm = 0.0
-                if abs(dy_norm) < Y_DEADZONE_NORM:
+                if abs(dy_norm) < float(fp.deadzone_y):
                     dy_norm = 0.0
 
-                # Compute deltas
-                delta_pan_deg = math.degrees(K_PAN_RAD_PER_NORM * dx_norm)
-                delta_pan_deg = clamp(delta_pan_deg, -PAN_MAX_DEG_PER_FRAME, PAN_MAX_DEG_PER_FRAME)
+                delta_pan_deg = float(gains.pan_deg_per_norm) * dx_norm
+                delta_y_m = float(gains.y_m_per_norm) * dy_norm
 
-                delta_y = K_Y_M_PER_NORM * dy_norm
-                delta_y = clamp(delta_y, -Y_MAX_M_PER_FRAME, Y_MAX_M_PER_FRAME)
+                delta_pan_deg = clamp(delta_pan_deg, -float(fp.pan_max_deg_per_frame), float(fp.pan_max_deg_per_frame))
+                delta_y_m = clamp(delta_y_m, -float(fp.y_max_m_per_frame), float(fp.y_max_m_per_frame))
 
-                did_move = (abs(delta_pan_deg) > 1e-6) or (abs(delta_y) > 1e-9)
+                did_move = (abs(delta_pan_deg) > 1e-4) or (abs(delta_y_m) > 1e-6)
 
                 if did_move:
                     with shared.lock:
-                        # Update shoulder_pan target
                         shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] + delta_pan_deg)
 
-                        # Update EE y and recompute joint2/3
-                        shared.current_y = float(shared.current_y + delta_y)
+                        shared.current_y = float(shared.current_y + delta_y_m)
                         j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
                         shared.target_positions["shoulder_lift"] = float(j2)
                         shared.target_positions["elbow_flex"] = float(j3)
 
-                    # Print only if something actually moved, and not too spammy
-                    now = time.time()
-                    if now - last_follow_print_ts > 0.08:
-                        last_follow_print_ts = now
-                        print(f"[FOLLOW] pan {delta_pan_deg:+.2f} deg, y {delta_y:+.4f} m, dx={dx_norm:+.2f}, dy={dy_norm:+.2f}")
+                    # Print only when movement happens
+                    t = now_ts()
+                    if t - last_follow_print_ts > 0.12:
+                        last_follow_print_ts = t
+                        print(f"[FOLLOW] pan {delta_pan_deg:+.2f}deg, y {delta_y_m:+.4f}m, dx={dx_norm:+.2f}, dy={dy_norm:+.2f}")
 
-        except Exception as e:
-            print(f"YOLO loop error: {e}")
-            traceback.print_exc()
-            stop_event.set()
+            # Show window, ESC only to quit
+            cv2.imshow("YOLO Live Detection", annotated)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                shared.stop_event.set()
+                break
+
+        except Exception:
+            shared.stop_event.set()
             break
 
     cv2.destroyAllWindows()
 
-# =========================
-# Keyboard + P-control loop
-# =========================
-def p_control_loop(robot, keyboard, stop_event: threading.Event, shared: SharedState, start_positions):
-    control_period = 1.0 / CONTROL_FREQ
-    step_counter = 0
 
+# -----------------------------
+# Keyboard mapping helpers
+# -----------------------------
+ESC_KEYS = {"esc", "escape", "ESC", "Key.esc", "Key.ESC"}
+LEFT_KEYS = {"left", "LEFT", "Key.left", "KEY_LEFT", "arrow_left"}
+RIGHT_KEYS = {"right", "RIGHT", "Key.right", "KEY_RIGHT", "arrow_right"}
+UP_KEYS = {"up", "UP", "Key.up", "KEY_UP", "arrow_up"}
+DOWN_KEYS = {"down", "DOWN", "Key.down", "KEY_DOWN", "arrow_down"}
+
+
+def is_arrow(key: str, keyset: set) -> bool:
+    return str(key) in keyset
+
+
+# -----------------------------
+# Main P-control loop
+# -----------------------------
+def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[str, float]):
     joint_controls = {
         "q": ("shoulder_pan", -1.0),
         "a": ("shoulder_pan", 1.0),
@@ -318,110 +728,217 @@ def p_control_loop(robot, keyboard, stop_event: threading.Event, shared: SharedS
         "h": ("gripper", 1.0),
     }
 
-    xy_controls = {
-        "w": ("x", -EE_STEP),
-        "s": ("x", EE_STEP),
-        "e": ("y", -EE_STEP),
-        "d": ("y", EE_STEP),
-    }
-
-    while not stop_event.is_set():
+    while not shared.stop_event.is_set():
         try:
             keyboard_action = keyboard.get_action()
 
-            # Handle key events (prints only on actual action)
+            # Handle keypress events only
             if keyboard_action:
                 for key in keyboard_action.keys():
-                    if key == "x":
-                        stop_event.set()
-                        print("[KEY] exit requested")
+                    k = str(key)
+
+                    # ESC to quit
+                    if k in ESC_KEYS:
+                        shared.stop_event.set()
+                        print("[KEY] ESC, exit")
                         break
 
-                    if key == "p":
+                    # Toggle follow
+                    if k == "p":
                         with shared.lock:
                             shared.follow_enabled = not shared.follow_enabled
-                            state = shared.follow_enabled
-                        print(f"[KEY] follow {'ON' if state else 'OFF'}")
+                            on = shared.follow_enabled
+                        print(f"[KEY] follow {'ON' if on else 'OFF'}")
+                        continue
 
-                    if key == "r":
+                    # Auto-calibrate follow
+                    if k == "c":
+                        run_follow_calibration(robot, shared)
+                        continue
+
+                    # Edit params
+                    if k == "k":
+                        tune_params_interactive(shared)
+                        continue
+
+                    # Select slot 0..9
+                    if len(k) == 1 and k.isdigit():
                         with shared.lock:
-                            shared.pitch += PITCH_STEP
-                            p = shared.pitch
-                        print(f"[KEY] pitch {p:+.1f} deg")
+                            shared.selected_slot = k
+                        print(f"[KEY] slot = {k}")
+                        continue
 
-                    if key == "f":
+                    # Store pose
+                    if k == "o":
                         with shared.lock:
-                            shared.pitch -= PITCH_STEP
-                            p = shared.pitch
-                        print(f"[KEY] pitch {p:+.1f} deg")
+                            slot = shared.selected_slot
+                        joints = read_joint_positions_deg(robot)
+                        with shared.lock:
+                            store_pose(shared, slot, joints)
+                        print(f"[POSE] saved slot {slot}")
+                        continue
 
-                    if key in joint_controls:
-                        jname, delta = joint_controls[key]
+                    # Go to pose
+                    if k == "i":
+                        with shared.lock:
+                            slot = shared.selected_slot
+                            pose = shared.settings.poses.get(slot)
+                        if pose is None:
+                            print(f"[POSE] slot {slot} vide")
+                        else:
+                            print(f"[POSE] goto slot {slot}")
+                            goto_pose_blocking(robot, shared, pose)
+                            print(f"[POSE] done slot {slot}")
+                        continue
+
+                    # Pitch adjust
+                    if k == "r":
+                        with shared.lock:
+                            shared.pitch += float(shared.settings.control.pitch_step)
+                            p = shared.pitch
+                        print(f"[KEY] pitch {p:+.1f}deg")
+                        continue
+
+                    if k == "f":
+                        with shared.lock:
+                            shared.pitch -= float(shared.settings.control.pitch_step)
+                            p = shared.pitch
+                        print(f"[KEY] pitch {p:+.1f}deg")
+                        continue
+
+                    # Joint direct controls
+                    if k in joint_controls:
+                        jname, delta = joint_controls[k]
                         with shared.lock:
                             cur = float(shared.target_positions.get(jname, 0.0))
                             new = cur + float(delta)
                             shared.target_positions[jname] = new
-                        print(f"[KEY] {jname} target {cur:.2f} -> {new:.2f} deg")
+                        print(f"[KEY] {jname} {cur:.2f} -> {new:.2f}deg")
+                        continue
 
-                    if key in xy_controls:
-                        coord, delta = xy_controls[key]
+                    # EE arrows: Left/Right for x, Up/Down for y
+                    moved_ee = False
+                    with shared.lock:
+                        step = float(shared.settings.control.ee_step)
+
+                    if is_arrow(k, LEFT_KEYS):
                         with shared.lock:
-                            if coord == "x":
-                                shared.current_x += float(delta)
-                            else:
-                                shared.current_y += float(delta)
+                            shared.current_x -= step
                             j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
                             shared.target_positions["shoulder_lift"] = float(j2)
                             shared.target_positions["elbow_flex"] = float(j3)
                             cx, cy = shared.current_x, shared.current_y
+                        moved_ee = True
+
+                    elif is_arrow(k, RIGHT_KEYS):
+                        with shared.lock:
+                            shared.current_x += step
+                            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                            shared.target_positions["shoulder_lift"] = float(j2)
+                            shared.target_positions["elbow_flex"] = float(j3)
+                            cx, cy = shared.current_x, shared.current_y
+                        moved_ee = True
+
+                    elif is_arrow(k, UP_KEYS):
+                        with shared.lock:
+                            shared.current_y -= step
+                            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                            shared.target_positions["shoulder_lift"] = float(j2)
+                            shared.target_positions["elbow_flex"] = float(j3)
+                            cx, cy = shared.current_x, shared.current_y
+                        moved_ee = True
+
+                    elif is_arrow(k, DOWN_KEYS):
+                        with shared.lock:
+                            shared.current_y += step
+                            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                            shared.target_positions["shoulder_lift"] = float(j2)
+                            shared.target_positions["elbow_flex"] = float(j3)
+                            cx, cy = shared.current_x, shared.current_y
+                        moved_ee = True
+
+                    if moved_ee:
                         print(f"[KEY] EE x={cx:.4f} y={cy:.4f} -> shoulder_lift={j2:.2f} elbow_flex={j3:.2f}")
+                        continue
 
-            # Update wrist_flex using pitch (quiet unless it changes via keypress)
+            # P-control tick
             with shared.lock:
+                cf = int(shared.settings.control.control_freq)
+                kp = float(shared.settings.control.kp)
                 pitch = float(shared.pitch)
-                if "shoulder_lift" in shared.target_positions and "elbow_flex" in shared.target_positions:
-                    shared.target_positions["wrist_flex"] = (
-                        -float(shared.target_positions["shoulder_lift"]) - float(shared.target_positions["elbow_flex"]) + pitch
-                    )
-                targets_snapshot = dict(shared.target_positions)
 
-            # Read robot positions (degrees) and apply P-control
+                # wrist_flex rule
+                shared.target_positions["wrist_flex"] = (
+                    -float(shared.target_positions["shoulder_lift"])
+                    -float(shared.target_positions["elbow_flex"])
+                    + pitch
+                )
+                targets = dict(shared.target_positions)
+
             obs = robot.get_observation()
-            current_positions = {}
-            for k, v in obs.items():
-                if k.endswith(".pos"):
-                    name = k.removesuffix(".pos")
-                    current_positions[name] = apply_fine_trim(name, float(v))
+            cur = {}
+            for kk, vv in obs.items():
+                if kk.endswith(".pos"):
+                    j = kk.removesuffix(".pos")
+                    cur[j] = float(vv)
 
             action = {}
-            for j, tgt in targets_snapshot.items():
-                if j in current_positions:
-                    cur = current_positions[j]
-                    err = float(tgt) - float(cur)
-                    action[f"{j}.pos"] = float(cur + KP * err)
+            for j, tgt in targets.items():
+                if j in cur:
+                    err = float(tgt) - float(cur[j])
+                    action[f"{j}.pos"] = float(cur[j] + kp * err)
 
             if action:
                 robot.send_action(action)
 
-            step_counter += 1
-            time.sleep(control_period)
+            time.sleep(1.0 / max(1, cf))
 
         except KeyboardInterrupt:
-            stop_event.set()
-            print("[KEY] KeyboardInterrupt")
+            shared.stop_event.set()
+            print("[KEY] KeyboardInterrupt, exit")
             break
-        except Exception as e:
-            stop_event.set()
-            print(f"P control loop error: {e}")
-            traceback.print_exc()
+        except Exception:
+            shared.stop_event.set()
             break
 
-    # Go home
+    # Return to start (quiet)
     try:
-        return_to_start_position(robot, stop_event, start_positions, kp=0.2, control_freq=CONTROL_FREQ)
+        # quick return using same kp/freq
+        t0 = now_ts()
+        while (now_ts() - t0) < 5.0 and start_positions and not shared.stop_event.is_set():
+            with shared.lock:
+                cf = int(shared.settings.control.control_freq)
+                kp = float(shared.settings.control.kp)
+
+            obs = robot.get_observation()
+            cur = {}
+            for kk, vv in obs.items():
+                if kk.endswith(".pos"):
+                    j = kk.removesuffix(".pos")
+                    cur[j] = float(vv)
+
+            total_err = 0.0
+            action = {}
+            for j, target in start_positions.items():
+                if j in cur:
+                    err = float(target) - float(cur[j])
+                    total_err += abs(err)
+                    action[f"{j}.pos"] = float(cur[j] + 0.2 * err)
+
+            if action:
+                robot.send_action(action)
+
+            if total_err < 2.0:
+                break
+
+            time.sleep(1.0 / max(1, cf))
     except Exception:
         pass
 
+
+# -----------------------------
+# Utility: camera probing (no prints)
+# -----------------------------
 def list_cameras(max_index=8):
     available = []
     for idx in range(max_index):
@@ -431,21 +948,20 @@ def list_cameras(max_index=8):
             cap_test.release()
     return available
 
-# =========================
+
+# -----------------------------
 # Main
-# =========================
+# -----------------------------
 def main():
-    print("SO101 YOLO follow toggle (p) + keyboard control")
-    print("=" * 60)
+    settings = load_settings(SETTINGS_PATH)
+    shared = SharedState(settings)
 
     robot = None
     keyboard = None
     cap = None
-    stop_event = threading.Event()
-    shared = SharedState()
 
     try:
-        # Imports depending on your lerobot version
+        # LeRobot imports depending on version
         try:
             from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
         except Exception:
@@ -456,7 +972,6 @@ def main():
         port = input("SO101 robot USB port (default /dev/ttyACM1): ").strip() or "/dev/ttyACM1"
         robot_id = input("Robot id (default SO101_follower): ").strip() or "SO101_follower"
 
-        # Use degrees so you don't see servo ticks
         robot_config = SO101FollowerConfig(port=port, id=robot_id, use_degrees=True)
         robot = SO101Follower(robot_config)
 
@@ -465,81 +980,46 @@ def main():
         robot.connect()
         keyboard.connect()
 
-        # Calibrate choice
-        while True:
-            calibrate_choice = input("Recalibrate now? (y/n): ").strip().lower()
-            if calibrate_choice in ["y", "yes"]:
-                robot.calibrate()
-                print("[INFO] calibration done")
-                break
-            if calibrate_choice in ["n", "no"]:
-                break
-            print("Please enter y or n")
+        # Read start positions
+        start_positions = read_joint_positions_deg(robot)
 
-        # Start joint angles (degrees)
-        start_obs = robot.get_observation()
-        start_positions = {}
-        for k, v in start_obs.items():
-            if k.endswith(".pos"):
-                name = k.removesuffix(".pos")
-                start_positions[name] = float(v)
+        # YOLO model
+        model = YOLO(settings.yolo.model_path)
 
-        move_to_zero_position(robot, stop_event, duration=3.0, kp=0.5, control_freq=CONTROL_FREQ)
+        # Determine target classes from settings
+        target_objects = normalize_target_names(settings.yolo.target_objects or ["cup"])
+        class_ids = get_class_ids_from_names(model, target_objects)
 
-        # YOLO init
-        model = YOLOE("yoloe-11l-seg.pt")
+        # Camera selection from settings or prompt once
+        cam_idx = settings.yolo.camera_index
+        if cam_idx is None:
+            cams = list_cameras()
+            if not cams:
+                raise RuntimeError("No camera found")
+            cam_idx = int(input(f"Select camera index {cams}: ").strip())
+            settings.yolo.camera_index = cam_idx
+            save_settings(SETTINGS_PATH, settings)
 
-        target_input = input("Objects to detect (comma-separated, default bottle): ").strip()
-        if not target_input:
-            target_objects = ["bottle"]
-        else:
-            target_objects = [obj.strip() for obj in target_input.split(",") if obj.strip()]
-        model.set_classes(target_objects, model.get_text_pe(target_objects))
-
-        cameras = list_cameras()
-        if not cameras:
-            print("No cameras found!")
-            return
-        print(f"Available cameras: {cameras}")
-        selected = int(input(f"Select camera index from {cameras}: ").strip())
-        cap = cv2.VideoCapture(selected)
+        cap = cv2.VideoCapture(int(cam_idx))
         if not cap.isOpened():
-            print("Camera not found!")
-            return
-
-        print("=" * 60)
-        print("Keys:")
-        print("  q/a: shoulder_pan -/+")
-        print("  w/s: EE x -/+ (updates shoulder_lift+elbow_flex)")
-        print("  e/d: EE y -/+ (updates shoulder_lift+elbow_flex)")
-        print("  r/f: pitch +/-(wrist_flex)")
-        print("  t/g: wrist_roll -/+")
-        print("  y/h: gripper close/open")
-        print("  p: toggle YOLO follow ON/OFF (default OFF)")
-        print("  x: exit (returns to start)")
-        print("")
-        print("YOLO window:")
-        print("  q or ESC: quit (also stops control)")
-        print("=" * 60)
+            raise RuntimeError("Camera open failed")
 
         # Start YOLO thread
-        video_thread = threading.Thread(target=yolo_loop, args=(model, cap, robot, stop_event, shared), daemon=True)
-        video_thread.start()
+        yolo_thread = threading.Thread(target=yolo_loop, args=(model, cap, class_ids, shared), daemon=True)
+        yolo_thread.start()
 
-        # Control loop in main thread
-        p_control_loop(robot, keyboard, stop_event, shared, start_positions)
+        # Run control loop
+        p_control_loop(robot, keyboard, shared, start_positions)
 
-    except Exception as e:
-        print(f"Program failed: {e}")
-        traceback.print_exc()
-        print("Checklist:")
-        print("  1) Robot connected and powered")
-        print("  2) Correct USB port (/dev/ttyACM*)")
-        print("  3) Permissions on the USB device")
-        print("  4) lerobot version contains SO101 follower")
+    except Exception:
+        # Keep this quiet-ish (no stacktrace spam)
+        print("Erreur: le programme s'est arrêté. (port/cam/poids YOLO/import lerobot)")
     finally:
+        # Save settings on exit
+        save_settings(SETTINGS_PATH, shared.settings)
+
         try:
-            stop_event.set()
+            shared.stop_event.set()
         except Exception:
             pass
         try:
@@ -561,7 +1041,7 @@ def main():
                 robot.disconnect()
         except Exception:
             pass
-        print("Program ended.")
+
 
 if __name__ == "__main__":
     main()
