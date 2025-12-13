@@ -705,10 +705,10 @@ def yolo_loop(model: YOLO, cap, class_ids: List[int], shared: SharedState):
 # Keyboard mapping helpers
 # -----------------------------
 ESC_KEYS = {"esc", "escape", "ESC", "Key.esc", "Key.ESC"}
-LEFT_KEYS = {"left", "LEFT", "Key.left", "KEY_LEFT", "arrow_left"}
-RIGHT_KEYS = {"right", "RIGHT", "Key.right", "KEY_RIGHT", "arrow_right"}
-UP_KEYS = {"up", "UP", "Key.up", "KEY_UP", "arrow_up"}
-DOWN_KEYS = {"down", "DOWN", "Key.down", "KEY_DOWN", "arrow_down"}
+LEFT_KEYS = {"s", "left", "LEFT", "Key.left", "KEY_LEFT", "arrow_left"}
+RIGHT_KEYS = {"w", "right", "RIGHT", "Key.right", "KEY_RIGHT", "arrow_right"}
+UP_KEYS = {"q", "up", "UP", "Key.up", "KEY_UP", "arrow_up"}
+DOWN_KEYS = {"e", "down", "DOWN", "Key.down", "KEY_DOWN", "arrow_down"}
 
 
 def is_arrow(key: str, keyset: set) -> bool:
@@ -720,8 +720,8 @@ def is_arrow(key: str, keyset: set) -> bool:
 # -----------------------------
 def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[str, float]):
     joint_controls = {
-        "q": ("shoulder_pan", -1.0),
-        "a": ("shoulder_pan", 1.0),
+        "a": ("shoulder_pan", -1.0),
+        "d": ("shoulder_pan", 1.0),
         "t": ("wrist_roll", -1.0),
         "g": ("wrist_roll", 1.0),
         "y": ("gripper", -1.0),
