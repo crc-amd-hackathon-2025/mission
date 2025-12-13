@@ -143,7 +143,7 @@ def move_to_zero_position(robot, duration=3.0, kp=0.5):
     }
     
     # Calculate control steps
-    control_freq = 50  # 60Hz control frequency
+    control_freq = 20  # 60Hz control frequency
     total_steps = int(duration * control_freq)
     step_time = 1.0 / control_freq
     
@@ -187,7 +187,7 @@ def move_to_zero_position(robot, duration=3.0, kp=0.5):
     
     print("Robot has moved to zero position")
 
-def return_to_start_position(robot, start_positions, kp=0.5, control_freq=50):
+def return_to_start_position(robot, start_positions, kp=0.5, control_freq=20):
     """
     Use P control to return to start position
     
@@ -293,7 +293,7 @@ def vision_control_update(target_positions, current_x, current_y, model, cap, K_
         raise KeyboardInterrupt
     return current_x, current_y
 
-def p_control_loop(robot, keyboard, target_positions, start_positions, current_x, current_y, kp=0.5, control_freq=50, model=None, cap=None, vision_mode=False, target_objects=["mouse"]):
+def p_control_loop(robot, keyboard, target_positions, start_positions, current_x, current_y, kp=0.5, control_freq=20, model=None, cap=None, vision_mode=False, target_objects=["mouse"]):
     """
     P control loop
     
@@ -576,7 +576,7 @@ def main():
         
         # Enable vision control
         vision_mode = True
-        p_control_loop(robot, keyboard, target_positions, start_positions, current_x, current_y, kp=0.5, control_freq=50, model=model, cap=cap, vision_mode=vision_mode, target_objects=target_objects)
+        p_control_loop(robot, keyboard, target_positions, start_positions, current_x, current_y, kp=0.5, control_freq=20, model=model, cap=cap, vision_mode=vision_mode, target_objects=target_objects)
         
         # Disconnect
         robot.disconnect()
