@@ -48,6 +48,7 @@ from lerobot.scripts.lerobot_record import record_loop
 from lerobot.utils.control_utils import init_keyboard_listener
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
 # -----------------------------
 # Silence Ultralytics console logs
@@ -71,6 +72,10 @@ PRETRAINED_POLICY_PATH = (
     "crc-amd-hackathon-2025/pi05-grab-cam"  # TODO: Replace with actual path
 )
 SINGLE_TASK = "Grab the camera"
+CAMERAS_CONFIG = {
+    "wrist": OpenCVCameraConfig(index_or_path=3, width=640, height=480, fps=30),
+    "top": OpenCVCameraConfig(index_or_path=4, width=640, height=480, fps=30),
+}
 
 
 # -----------------------------
@@ -1439,7 +1444,7 @@ def main():
         )
         print()
 
-        robot_config = SO101FollowerConfig(port=port, id=robot_id, use_degrees=True)
+        robot_config = SO101FollowerConfig(port=port, id=robot_id, cameras=CAMERAS_CONFIG, use_degrees=True)
         robot = SO101Follower(robot_config)
 
         keyboard = KeyboardTeleop(KeyboardTeleopConfig())
