@@ -152,14 +152,19 @@ class YoloParams:
 
 @dataclass
 class FollowParams:
-    deadzone_x: float = 0.06
-    deadzone_y: float = 0.05
-    pan_max_deg_per_frame: float = 3.0
-    y_max_m_per_frame: float = 0.005
-    calibration_fraction: float = 0.5      # Réduit pour gains plus conservateurs
-    calibration_pan_step_deg: float = 3.0  # Augmenté pour meilleure détection de changement
-    calibration_y_step_m: float = 0.005    # Augmenté pour meilleure détection
-    calibration_settle_frames: int = 12    # Augmenté pour plus de stabilité
+    # Seuil de détection: si |erreur| < deadzone, pas de mouvement
+    deadzone_x: float = 0.05      # Tolérance horizontale (5% du cadre)
+    deadzone_y: float = 0.05      # Tolérance verticale (5% du cadre)
+    
+    # Limite de vitesse par frame (sécurité pour mouvement fluide)
+    pan_max_deg_per_frame: float = 2.0      # Max rotation par frame
+    y_max_m_per_frame: float = 0.003        # Max déplacement Y par frame
+    
+    # Paramètres de calibration pour ajuster le gain du suivi
+    calibration_steps: int = 5               # Nombre de mesures pour calibration
+    calibration_pan_step_deg: float = 3.0   # Pas de rotation pendant calibration
+    calibration_y_step_m: float = 0.005     # Pas de mouvement Y pendant calibration
+    calibration_settle_time_s: float = 1.0  # Temps d'attente pour stabilisation
 
 @dataclass
 class SavedPose:
@@ -397,188 +402,237 @@ def wait_for_new_boxes(shared: SharedState, n: int, timeout_s: float = 2.5) -> b
 
 
 def run_follow_calibration(robot, shared: SharedState) -> None:
-    # Event function: prints are allowed here
+    """
+    Calibration interactive du suivi YOLO.
+    
+    Cette fonction demande à l'utilisateur de:
+    1. Placer l'objet exactement au centre
+    2. Effectuer 5 déplacements PAN, l'utilisateur suit avec l'objet
+    3. Effectuer 5 déplacements Y, l'utilisateur suit avec l'objet
+    4. Calcul des gains automatiques basés sur les mesures
+    """
+    print()
+    print("╔" + "=" * 68 + "╗")
+    print("║" + "CALIBRATION INTERACTIVE DU SUIVI YOLO".center(68) + "║")
+    print("╚" + "=" * 68 + "╝")
+    print()
+    
     with shared.lock:
         box0 = shared.last_best_box
         shape0 = shared.last_frame_shape
-        pan_step_deg = float(shared.settings.follow.calibration_pan_step_deg)
-        y_step_m = float(shared.settings.follow.calibration_y_step_m)
-        settle_frames = int(shared.settings.follow.calibration_settle_frames)
-        frac = float(shared.settings.follow.calibration_fraction)
-
+    
     if box0 is None or shape0 is None:
-        print("[CAL] ❌ Pas de détection disponible.")
-        print("[CAL] → Place l'objet bien visible au centre du champ et relance 'c'")
+        print("❌ ERREUR: Aucun objet détecté!")
+        print("   → Placez l'objet devant le robot et relancez la calibration")
+        print()
         return
-
-    base_dx, base_dy = box_center_norm(box0, (shape0[0], shape0[1], 3))
-    print(f"[CAL] ✓ Position de base détectée: dx={base_dx:+.3f}, dy={base_dy:+.3f}")
-    print()
-
-    # ============================================================
-    # ÉTAPE 1: Calibration PAN (rotation horizontale)
-    # ============================================================
-    print("[CAL] ÉTAPE 1 : Calibration PAN (rotation)")
-    print(f"[CAL]   Direction: +{pan_step_deg:+.1f}°")
-    pan_deltas = []
     
-    for step_num in range(3):
-        print(f"[CAL]   Mesure {step_num + 1}/3...")
-        
-        # Move pan positive
-        with shared.lock:
-            shared.target_positions["shoulder_pan"] = float(
-                shared.target_positions["shoulder_pan"] + pan_step_deg
-            )
-        
-        if not wait_for_new_boxes(shared, settle_frames, timeout_s=3.0):
-            print(f"[CAL]   ⚠ Détection perdue après mouvement pan")
-            with shared.lock:
-                shared.target_positions["shoulder_pan"] = float(
-                    shared.target_positions["shoulder_pan"] - pan_step_deg
-                )
-            continue
-
-        with shared.lock:
-            b_pan = shared.last_best_box
-            s_pan = shared.last_frame_shape
-
-        if b_pan is None or s_pan is None:
-            print(f"[CAL]   ⚠ Détection invalide après pan")
-            with shared.lock:
-                shared.target_positions["shoulder_pan"] = float(
-                    shared.target_positions["shoulder_pan"] - pan_step_deg
-                )
-            continue
-
-        dx_pan, dy_pan = box_center_norm(b_pan, (s_pan[0], s_pan[1], 3))
-        delta_dx = dx_pan - base_dx
-        pan_deltas.append(delta_dx)
-        print(f"[CAL]   ✓ delta_dx = {delta_dx:+.4f}")
-
-        # Revert pan
-        with shared.lock:
-            shared.target_positions["shoulder_pan"] = float(
-                shared.target_positions["shoulder_pan"] - pan_step_deg
-            )
-        time.sleep(0.15)
-
-    if not pan_deltas:
-        print("[CAL] ❌ Impossible d'effectuer la calibration PAN")
-        return
-
-    avg_delta_dx = sum(pan_deltas) / len(pan_deltas)
-    print(f"[CAL] → Moyenne: delta_dx = {avg_delta_dx:+.4f}")
+    print("✅ Objet détecté")
     print()
-
-    # ============================================================
-    # ÉTAPE 2: Calibration Y (mouvement vertical)
-    # ============================================================
-    print("[CAL] ÉTAPE 2 : Calibration Y (mouvement vertical)")
-    print(f"[CAL]   Direction: +{y_step_m:+.4f}m")
-    y_deltas = []
-
-    for step_num in range(3):
-        print(f"[CAL]   Mesure {step_num + 1}/3...")
+    
+    # Vérifier que l'objet est à peu près centré
+    dx_init, dy_init = box_center_norm(box0, (shape0[0], shape0[1], 3))
+    print(f"Position initiale de l'objet: dx={dx_init:+.3f}, dy={dy_init:+.3f}")
+    
+    if abs(dx_init) > 0.15 or abs(dy_init) > 0.15:
+        print("⚠️  ATTENTION: L'objet n'est pas au centre du cadre!")
+        print("   → Placez l'objet plus au centre et relancez")
+        print()
+        return
+    
+    print()
+    print("─" * 70)
+    print("ÉTAPE 1: CALIBRATION PAN (rotation horizontale)")
+    print("─" * 70)
+    print()
+    print("Instructions:")
+    print("  • Appuyez ENTRÉE pour démarrer")
+    print("  • Le robot tournera 5 fois (+3° et -3°)")
+    print("  • À CHAQUE mouvement, suivez l'objet avec la caméra")
+    print("    pour qu'il RESTE AU CENTRE du cadre")
+    print("  • Restez prêt à appuyer CTRL+C si le robot s'éloigne trop")
+    print()
+    
+    try:
+        input("Appuyez ENTRÉE pour commencer la calibration PAN: ")
+    except KeyboardInterrupt:
+        print("\n❌ Calibration annulée")
+        return
+    
+    print()
+    
+    with shared.lock:
+        pan_step = float(shared.settings.follow.calibration_pan_step_deg)
+        settle_time = float(shared.settings.follow.calibration_settle_time_s)
+    
+    pan_measurements = []
+    
+    for i in range(5):
+        print(f"Mesure PAN {i+1}/5...")
         
-        # Move Y positive
+        # Bouger le robot
         with shared.lock:
-            shared.current_y = float(shared.current_y + y_step_m)
+            current_pan = float(shared.target_positions["shoulder_pan"])
+            shared.target_positions["shoulder_pan"] = current_pan + pan_step
+        
+        # Attendre stabilisation
+        time.sleep(settle_time + 0.2)
+        
+        # Prendre la mesure
+        with shared.lock:
+            box_after = shared.last_best_box
+            shape_after = shared.last_frame_shape
+        
+        if box_after is None or shape_after is None:
+            print(f"  ⚠️  Objet perdu pendant la mesure! Revenez à la position initiale")
+            with shared.lock:
+                shared.target_positions["shoulder_pan"] = current_pan
+            time.sleep(0.5)
+            continue
+        
+        # Calculer le déplacement de l'objet dans l'image
+        dx_after, dy_after = box_center_norm(box_after, (shape_after[0], shape_after[1], 3))
+        delta_dx = dx_after - dx_init
+        
+        # Revenir à la position initiale
+        with shared.lock:
+            shared.target_positions["shoulder_pan"] = current_pan
+        
+        time.sleep(settle_time + 0.2)
+        
+        pan_measurements.append((pan_step, delta_dx))
+        print(f"  ✓ Pan +{pan_step:.1f}° → objet a bougé de {delta_dx:+.3f} dans l'image")
+        print()
+    
+    if not pan_measurements:
+        print("❌ Impossible d'effectuer la calibration PAN")
+        return
+    
+    # Calculer le gain PAN moyen
+    gain_pan_list = []
+    for step, delta in pan_measurements:
+        if abs(delta) > 0.001:  # Éviter division par zéro
+            gain = step / delta  # En degrés par normalisé
+            gain_pan_list.append(gain)
+            print(f"  Gain: {gain:+.2f} deg/norm (pour step {step:.1f}°, delta {delta:+.3f})")
+    
+    if gain_pan_list:
+        gain_pan_avg = sum(gain_pan_list) / len(gain_pan_list)
+        print()
+        print(f"✅ Gain PAN moyen: {gain_pan_avg:+.2f} deg/norm")
+    else:
+        print("❌ Impossible de calculer le gain PAN")
+        return
+    
+    print()
+    print("─" * 70)
+    print("ÉTAPE 2: CALIBRATION Y (mouvement vertical)")
+    print("─" * 70)
+    print()
+    print("Instructions:")
+    print("  • Appuyez ENTRÉE pour démarrer")
+    print("  • Le robot montera/descendra 5 fois (+0.5cm et -0.5cm)")
+    print("  • À CHAQUE mouvement, suivez l'objet avec la caméra")
+    print("    pour qu'il RESTE AU CENTRE du cadre")
+    print()
+    
+    try:
+        input("Appuyez ENTRÉE pour commencer la calibration Y: ")
+    except KeyboardInterrupt:
+        print("\n❌ Calibration annulée")
+        return
+    
+    print()
+    
+    with shared.lock:
+        y_step = float(shared.settings.follow.calibration_y_step_m)
+    
+    y_measurements = []
+    
+    for i in range(5):
+        print(f"Mesure Y {i+1}/5...")
+        
+        # Bouger le robot en Y
+        with shared.lock:
+            current_y = float(shared.current_y)
+            shared.current_y = current_y + y_step
             j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
             shared.target_positions["shoulder_lift"] = float(j2)
             shared.target_positions["elbow_flex"] = float(j3)
-
-        if not wait_for_new_boxes(shared, settle_frames, timeout_s=3.0):
-            print(f"[CAL]   ⚠ Détection perdue après mouvement y")
+        
+        # Attendre stabilisation
+        time.sleep(settle_time + 0.2)
+        
+        # Prendre la mesure
+        with shared.lock:
+            box_after = shared.last_best_box
+            shape_after = shared.last_frame_shape
+        
+        if box_after is None or shape_after is None:
+            print(f"  ⚠️  Objet perdu pendant la mesure! Revenez à la position initiale")
             with shared.lock:
-                shared.current_y = float(shared.current_y - y_step_m)
+                shared.current_y = current_y
                 j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
                 shared.target_positions["shoulder_lift"] = float(j2)
                 shared.target_positions["elbow_flex"] = float(j3)
+            time.sleep(0.5)
             continue
-
+        
+        # Calculer le déplacement de l'objet dans l'image
+        dx_after, dy_after = box_center_norm(box_after, (shape_after[0], shape_after[1], 3))
+        delta_dy = dy_after - dy_init
+        
+        # Revenir à la position initiale
         with shared.lock:
-            b_y = shared.last_best_box
-            s_y = shared.last_frame_shape
-
-        if b_y is None or s_y is None:
-            print(f"[CAL]   ⚠ Détection invalide après y")
-            with shared.lock:
-                shared.current_y = float(shared.current_y - y_step_m)
-                j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
-                shared.target_positions["shoulder_lift"] = float(j2)
-                shared.target_positions["elbow_flex"] = float(j3)
-            continue
-
-        dx_y, dy_y = box_center_norm(b_y, (s_y[0], s_y[1], 3))
-        delta_dy = dy_y - base_dy
-        y_deltas.append(delta_dy)
-        print(f"[CAL]   ✓ delta_dy = {delta_dy:+.4f}")
-
-        # Revert Y
-        with shared.lock:
-            shared.current_y = float(shared.current_y - y_step_m)
+            shared.current_y = current_y
             j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
             shared.target_positions["shoulder_lift"] = float(j2)
             shared.target_positions["elbow_flex"] = float(j3)
-        time.sleep(0.15)
-
-    if not y_deltas:
-        print("[CAL] ❌ Impossible d'effectuer la calibration Y")
-        return
-
-    avg_delta_dy = sum(y_deltas) / len(y_deltas)
-    print(f"[CAL] → Moyenne: delta_dy = {avg_delta_dy:+.4f}")
-    print()
-
-    # ============================================================
-    # ÉTAPE 3: Calcul des gains (avec facteur de fraction)
-    # ============================================================
-    print("[CAL] ÉTAPE 3 : Calcul des gains de suivi")
+        
+        time.sleep(settle_time + 0.2)
+        
+        y_measurements.append((y_step, delta_dy))
+        print(f"  ✓ Y +{y_step*100:.1f}cm → objet a bougé de {delta_dy:+.3f} dans l'image")
+        print()
     
-    eps = 1e-6
-    ok_pan = abs(avg_delta_dx) > eps
-    ok_y = abs(avg_delta_dy) > eps
-
-    pan_gain = None
-    y_gain = None
-
-    if ok_pan:
-        pan_gain = -(frac * pan_step_deg / avg_delta_dx)
-        print(f"[CAL]   ✓ Gain PAN: {pan_gain:+.4f} deg/norm")
+    if not y_measurements:
+        print("❌ Impossible d'effectuer la calibration Y")
+        return
+    
+    # Calculer le gain Y moyen
+    gain_y_list = []
+    for step, delta in y_measurements:
+        if abs(delta) > 0.001:  # Éviter division par zéro
+            gain = step / delta  # En mètres par normalisé
+            gain_y_list.append(gain)
+            print(f"  Gain: {gain:+.6f} m/norm (pour step {step:.4f}m, delta {delta:+.3f})")
+    
+    if gain_y_list:
+        gain_y_avg = sum(gain_y_list) / len(gain_y_list)
+        print()
+        print(f"✅ Gain Y moyen: {gain_y_avg:+.6f} m/norm")
     else:
-        print(f"[CAL]   ❌ Détection PAN invalide (delta trop petit)")
-
-    if ok_y:
-        y_gain = -(frac * y_step_m / avg_delta_dy)
-        print(f"[CAL]   ✓ Gain Y:   {y_gain:+.6f} m/norm")
-    else:
-        print(f"[CAL]   ❌ Détection Y invalide (delta trop petit)")
-
+        print("❌ Impossible de calculer le gain Y")
+        return
+    
+    # Sauvegarder les gains
     print()
-
-    # ============================================================
-    # ÉTAPE 4: Validation et sauvegarde
-    # ============================================================
-    if ok_pan and ok_y:
-        print("[CAL] ✅ Calibration RÉUSSIE !")
-        with shared.lock:
-            shared.settings.gains.pan_deg_per_norm = pan_gain
-            shared.settings.gains.y_m_per_norm = y_gain
-            shared.settings.gains.calibrated = True
-            gp = shared.settings.gains.pan_deg_per_norm
-            gy = shared.settings.gains.y_m_per_norm
-
-        save_settings(SETTINGS_PATH, shared.settings)
-        print(f"[CAL] Gains sauvegardés: pan={gp:+.4f}, y={gy:+.6f}")
-        print("[CAL] ========== CALIBRATION TERMINÉE (OK) ==========")
-    else:
-        print("[CAL] ❌ Calibration ÉCHOUÉE")
-        print("[CAL] → Vérifications:")
-        print(f"[CAL]   • Objet bien centré et visible?")
-        print(f"[CAL]   • Caméra bien allumée et branchée?")
-        print(f"[CAL]   • Détection assez stable (conf > 0.15)?")
-        print("[CAL] ========== CALIBRATION TERMINÉE (ÉCHEC) ==========")
+    print("─" * 70)
+    print("RÉSUMÉ")
+    print("─" * 70)
+    print(f"Gain PAN: {gain_pan_avg:+.2f} deg/norm")
+    print(f"Gain Y:   {gain_y_avg:+.6f} m/norm")
+    print()
+    
+    with shared.lock:
+        shared.settings.gains.pan_deg_per_norm = gain_pan_avg
+        shared.settings.gains.y_m_per_norm = gain_y_avg
+        shared.settings.gains.calibrated = True
+    
+    save_settings(SETTINGS_PATH, shared.settings)
+    
+    print("✅ CALIBRATION RÉUSSIE - Gains sauvegardés!")
+    print()
 
 
 # -----------------------------
