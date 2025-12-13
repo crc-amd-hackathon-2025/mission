@@ -4,3 +4,4 @@ mission/code/outputs/
 *.pt
 .venv/
 so101_yolo_follow_settings.json
+__pycache__
