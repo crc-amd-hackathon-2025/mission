@@ -8,6 +8,7 @@ Keys:
 - ESC: quit (both in YOLO window and keyboard teleop)
 - p: toggle follow ON/OFF (default OFF)
 - c: auto-calibrate follow (hold the target visible, ideally near center)
+- b: run pretrained policy inference (one step)
 - k: edit CONTROL_FREQ, KP, EE_STEP, PITCH_STEP
 - Digits 0..9: select memory slot
 - o: store current pose to selected slot
@@ -26,18 +27,27 @@ EE controls:
 Notes:
 - Uses LeRobot SO101 follower in degrees (use_degrees=True).
 - YOLO is COCO with yolo11x.pt.
+- Pretrained policy is loaded from PRETRAINED_POLICY_PATH (local or HuggingFace Hub).
 """
 
-import os
 import json
-import time
-import math
-import cv2
-import threading
-import traceback
 import logging
-from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional, Tuple, List
+import math
+import os
+import threading
+import time
+import traceback
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import torch
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+from lerobot.scripts.lerobot_record import record_loop
+from lerobot.utils.control_utils import init_keyboard_listener
+from lerobot.utils.utils import log_say
+from lerobot.utils.visualization_utils import init_rerun
 
 # -----------------------------
 # Silence Ultralytics console logs
@@ -48,12 +58,19 @@ logging.getLogger("ultralytics.utils").setLevel(logging.ERROR)
 
 from ultralytics import YOLO  # noqa: E402
 
-
 # -----------------------------
 # Persistent settings file
 # -----------------------------
 SETTINGS_PATH = "so101_yolo_follow_settings.json"
 SETTINGS_VERSION = 1
+
+# -----------------------------
+# Pretrained policy path (local or HuggingFace Hub)
+# -----------------------------
+PRETRAINED_POLICY_PATH = (
+    "crc-amd-hackathon-2025/pi05-grab-cam"  # TODO: Replace with actual path
+)
+SINGLE_TASK = "Grab the camera"
 
 
 # -----------------------------
@@ -126,9 +143,10 @@ def now_ts() -> float:
 # -----------------------------
 @dataclass
 class FollowGains:
-    pan_deg_per_norm: float = 3.0    # delta_pan_deg = gain * dx_norm (POSITIF!)
-    y_m_per_norm: float = -0.008     # delta_y_m = gain * dy_norm (NEGATIF car y inversé)
+    pan_deg_per_norm: float = 3.0  # delta_pan_deg = gain * dx_norm (POSITIF!)
+    y_m_per_norm: float = -0.008  # delta_y_m = gain * dy_norm (NEGATIF car y inversé)
     calibrated: bool = False
+
 
 @dataclass
 class ControlParams:
@@ -136,6 +154,7 @@ class ControlParams:
     kp: float = 0.3
     ee_step: float = 0.004
     pitch_step: float = 1.0
+
 
 @dataclass
 class YoloParams:
@@ -150,21 +169,23 @@ class YoloParams:
         if self.target_objects is None:
             self.target_objects = ["cup"]
 
+
 @dataclass
 class FollowParams:
     # Seuil de détection: si |erreur| < deadzone, pas de mouvement
-    deadzone_x: float = 0.08      # Tolérance horizontale (8% du cadre)
-    deadzone_y: float = 0.08      # Tolérance verticale (8% du cadre)
-    
+    deadzone_x: float = 0.08  # Tolérance horizontale (8% du cadre)
+    deadzone_y: float = 0.08  # Tolérance verticale (8% du cadre)
+
     # Limite de vitesse par frame (sécurité pour mouvement fluide)
-    pan_max_deg_per_frame: float = 2.5      # Max rotation par frame
-    y_max_m_per_frame: float = 0.004        # Max déplacement Y par frame
-    
+    pan_max_deg_per_frame: float = 2.5  # Max rotation par frame
+    y_max_m_per_frame: float = 0.004  # Max déplacement Y par frame
+
     # Paramètres de calibration pour ajuster le gain du suivi
-    calibration_steps: int = 3               # Nombre de mesures pour calibration
-    calibration_pan_step_deg: float = 5.0   # Pas de rotation pendant calibration
-    calibration_y_step_m: float = 0.008     # Pas de mouvement Y pendant calibration
+    calibration_steps: int = 3  # Nombre de mesures pour calibration
+    calibration_pan_step_deg: float = 5.0  # Pas de rotation pendant calibration
+    calibration_y_step_m: float = 0.008  # Pas de mouvement Y pendant calibration
     calibration_settle_time_s: float = 0.8  # Temps d'attente pour stabilisation
+
 
 @dataclass
 class SavedPose:
@@ -173,6 +194,7 @@ class SavedPose:
     current_y: float
     pitch: float
     timestamp: float
+
 
 @dataclass
 class AppSettings:
@@ -212,7 +234,9 @@ def _dict_to_dataclass(settings_dict: Dict[str, Any]) -> AppSettings:
     s.yolo.imgsz = int(y.get("imgsz", s.yolo.imgsz))
     s.yolo.conf = float(y.get("conf", s.yolo.conf))
     s.yolo.iou = float(y.get("iou", s.yolo.iou))
-    s.yolo.target_objects = list(y.get("target_objects", s.yolo.target_objects or ["cup"]))
+    s.yolo.target_objects = list(
+        y.get("target_objects", s.yolo.target_objects or ["cup"])
+    )
     s.yolo.camera_index = y.get("camera_index", s.yolo.camera_index)
     if s.yolo.camera_index is not None:
         try:
@@ -224,16 +248,30 @@ def _dict_to_dataclass(settings_dict: Dict[str, Any]) -> AppSettings:
     fp = settings_dict.get("follow", {})
     s.follow.deadzone_x = float(fp.get("deadzone_x", s.follow.deadzone_x))
     s.follow.deadzone_y = float(fp.get("deadzone_y", s.follow.deadzone_y))
-    s.follow.pan_max_deg_per_frame = float(fp.get("pan_max_deg_per_frame", s.follow.pan_max_deg_per_frame))
-    s.follow.y_max_m_per_frame = float(fp.get("y_max_m_per_frame", s.follow.y_max_m_per_frame))
-    s.follow.calibration_steps = int(fp.get("calibration_steps", s.follow.calibration_steps))
-    s.follow.calibration_pan_step_deg = float(fp.get("calibration_pan_step_deg", s.follow.calibration_pan_step_deg))
-    s.follow.calibration_y_step_m = float(fp.get("calibration_y_step_m", s.follow.calibration_y_step_m))
-    s.follow.calibration_settle_time_s = float(fp.get("calibration_settle_time_s", s.follow.calibration_settle_time_s))
+    s.follow.pan_max_deg_per_frame = float(
+        fp.get("pan_max_deg_per_frame", s.follow.pan_max_deg_per_frame)
+    )
+    s.follow.y_max_m_per_frame = float(
+        fp.get("y_max_m_per_frame", s.follow.y_max_m_per_frame)
+    )
+    s.follow.calibration_steps = int(
+        fp.get("calibration_steps", s.follow.calibration_steps)
+    )
+    s.follow.calibration_pan_step_deg = float(
+        fp.get("calibration_pan_step_deg", s.follow.calibration_pan_step_deg)
+    )
+    s.follow.calibration_y_step_m = float(
+        fp.get("calibration_y_step_m", s.follow.calibration_y_step_m)
+    )
+    s.follow.calibration_settle_time_s = float(
+        fp.get("calibration_settle_time_s", s.follow.calibration_settle_time_s)
+    )
 
     # gains
     g = settings_dict.get("gains", {})
-    s.gains.pan_deg_per_norm = float(g.get("pan_deg_per_norm", s.gains.pan_deg_per_norm))
+    s.gains.pan_deg_per_norm = float(
+        g.get("pan_deg_per_norm", s.gains.pan_deg_per_norm)
+    )
     s.gains.y_m_per_norm = float(g.get("y_m_per_norm", s.gains.y_m_per_norm))
     s.gains.calibrated = bool(g.get("calibrated", s.gains.calibrated))
 
@@ -296,7 +334,7 @@ class SharedState:
 
         # follow toggle (default OFF)
         self.follow_enabled = False
-        
+
         # Debounce pour la touche 'p' (temps minimum entre deux pressions)
         self.last_p_press_time: float = 0.0
         self.p_debounce_delay: float = 0.3  # 300ms entre chaque toggle
@@ -366,7 +404,9 @@ def get_class_ids_from_names(model: YOLO, names: List[str]) -> List[int]:
     return ids
 
 
-def pick_best_box(result0) -> Tuple[Optional[Tuple[float, float, float, float]], Optional[float]]:
+def pick_best_box(
+    result0,
+) -> Tuple[Optional[Tuple[float, float, float, float]], Optional[float]]:
     boxes = result0.boxes
     if boxes is None or len(boxes) == 0:
         return None, None
@@ -378,7 +418,9 @@ def pick_best_box(result0) -> Tuple[Optional[Tuple[float, float, float, float]],
     return (float(box[0]), float(box[1]), float(box[2]), float(box[3])), conf
 
 
-def box_center_norm(box: Tuple[float, float, float, float], frame_shape) -> Tuple[float, float]:
+def box_center_norm(
+    box: Tuple[float, float, float, float], frame_shape
+) -> Tuple[float, float]:
     h, w = frame_shape[:2]
     x1, y1, x2, y2 = box
     cx = 0.5 * (x1 + x2)
@@ -391,16 +433,18 @@ def box_center_norm(box: Tuple[float, float, float, float], frame_shape) -> Tupl
 # -----------------------------
 # Follow calibration (key 'c') - Calibration automatique simplifiée
 # -----------------------------
-def wait_for_stable_detection(shared: SharedState, min_frames: int = 5, timeout_s: float = 3.0) -> Tuple[Optional[Tuple[float, float, float, float]], Optional[Tuple[int, int]]]:
+def wait_for_stable_detection(
+    shared: SharedState, min_frames: int = 5, timeout_s: float = 3.0
+) -> Tuple[Optional[Tuple[float, float, float, float]], Optional[Tuple[int, int]]]:
     stable_count = 0
     last_box = None
     t0 = now_ts()
-    
+
     while (now_ts() - t0) < timeout_s and not shared.stop_event.is_set():
         with shared.lock:
             box = shared.last_best_box
             shape = shared.last_frame_shape
-        
+
         if box is not None and shape is not None:
             if last_box is not None:
                 x_diff = abs((box[0] + box[2]) / 2 - (last_box[0] + last_box[2]) / 2)
@@ -412,28 +456,28 @@ def wait_for_stable_detection(shared: SharedState, min_frames: int = 5, timeout_
             else:
                 stable_count = 1
             last_box = box
-            
+
             if stable_count >= min_frames:
                 return box, shape
         else:
             stable_count = 0
             last_box = None
-        
+
         time.sleep(0.05)
-    
+
     return None, None
 
 
 def run_follow_calibration(robot, shared: SharedState) -> None:
     """
     Calibration automatique du suivi YOLO.
-    
+
     Cette fonction:
     1. Demande à l'utilisateur de placer un objet devant le robot
     2. Effectue des mouvements automatiques du robot
     3. Mesure comment la position de l'objet change dans l'image
     4. Calcule automatiquement les gains corrects pour le suivi
-    
+
     Le principe est simple:
     - Si le robot tourne de +X degrés et que l'objet se déplace de +D dans l'image,
       alors pour centrer l'objet (qui est à +D), il faut tourner de +X degrés.
@@ -444,12 +488,12 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
     print("║" + "CALIBRATION AUTOMATIQUE DU SUIVI".center(68) + "║")
     print("╚" + "=" * 68 + "╝")
     print()
-    
+
     # Désactiver le suivi pendant la calibration
     with shared.lock:
         prev_follow = shared.follow_enabled
         shared.follow_enabled = False
-    
+
     try:
         print("📋 Instructions:")
         print("   1. Placez un objet (du type configuré) DEVANT le robot")
@@ -457,19 +501,19 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
         print("   3. NE BOUGEZ PAS l'objet pendant la calibration")
         print("   4. Le robot va effectuer de petits mouvements de test")
         print()
-        
+
         try:
             input("Appuyez ENTRÉE quand l'objet est en place: ")
         except KeyboardInterrupt:
             print("\n❌ Calibration annulée")
             return
-        
+
         print()
         print("🔍 Recherche de l'objet...")
-        
+
         # Attendre une détection stable
         box_initial, shape_initial = wait_for_stable_detection(shared)
-        
+
         if box_initial is None or shape_initial is None:
             print("❌ ERREUR: Aucun objet détecté de manière stable!")
             print("   Vérifiez:")
@@ -477,63 +521,73 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
             print("   - L'objet est bien éclairé et visible")
             print("   - La caméra fonctionne")
             return
-        
-        dx_init, dy_init = box_center_norm(box_initial, (shape_initial[0], shape_initial[1], 3))
+
+        dx_init, dy_init = box_center_norm(
+            box_initial, (shape_initial[0], shape_initial[1], 3)
+        )
         print(f"✅ Objet détecté! Position: dx={dx_init:+.3f}, dy={dy_init:+.3f}")
-        
+
         if abs(dx_init) > 0.25 or abs(dy_init) > 0.25:
             print("⚠️  L'objet n'est pas bien centré, mais on continue...")
-        
+
         print()
         print("─" * 70)
         print("ÉTAPE 1: Calibration de la ROTATION (PAN)")
         print("─" * 70)
         print()
-        
+
         with shared.lock:
             pan_step = float(shared.settings.follow.calibration_pan_step_deg)
             settle_time = float(shared.settings.follow.calibration_settle_time_s)
             initial_pan = float(shared.target_positions["shoulder_pan"])
-        
+
         pan_measurements = []
-        
+
         for direction in [1, -1, 1]:  # +, -, + pour 3 mesures
             step = pan_step * direction
-            
+
             # Mesurer position initiale de l'objet
-            box_before, shape_before = wait_for_stable_detection(shared, min_frames=3, timeout_s=1.5)
+            box_before, shape_before = wait_for_stable_detection(
+                shared, min_frames=3, timeout_s=1.5
+            )
             if box_before is None:
                 print("⚠️  Objet perdu, tentative de récupération...")
                 time.sleep(0.5)
                 continue
-            
-            dx_before, _ = box_center_norm(box_before, (shape_before[0], shape_before[1], 3))
-            
+
+            dx_before, _ = box_center_norm(
+                box_before, (shape_before[0], shape_before[1], 3)
+            )
+
             # Bouger le robot
             print(f"   → Rotation de {step:+.1f}°...")
             with shared.lock:
                 current_pan = float(shared.target_positions["shoulder_pan"])
                 shared.target_positions["shoulder_pan"] = current_pan + step
-            
+
             time.sleep(settle_time)
-            
+
             # Mesurer nouvelle position de l'objet
-            box_after, shape_after = wait_for_stable_detection(shared, min_frames=3, timeout_s=1.5)
+            box_after, shape_after = wait_for_stable_detection(
+                shared, min_frames=3, timeout_s=1.5
+            )
             if box_after is None:
                 print("   ⚠️  Objet perdu après rotation, annulation de cette mesure")
                 with shared.lock:
                     shared.target_positions["shoulder_pan"] = current_pan
                 time.sleep(settle_time / 2)
                 continue
-            
-            dx_after, _ = box_center_norm(box_after, (shape_after[0], shape_after[1], 3))
+
+            dx_after, _ = box_center_norm(
+                box_after, (shape_after[0], shape_after[1], 3)
+            )
             delta_dx = dx_after - dx_before
-            
+
             # Revenir à la position initiale
             with shared.lock:
                 shared.target_positions["shoulder_pan"] = current_pan
             time.sleep(settle_time / 2)
-            
+
             if abs(delta_dx) > 0.01:  # Mouvement significatif détecté
                 # Le gain est: combien de degrés par unité normalisée
                 # Pour centrer un objet à dx_norm, on doit tourner de (gain * dx_norm) degrés
@@ -541,61 +595,69 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
                 # alors pour corriger un objet à +dx_norm, on tourne de +(step/delta_dx)*dx_norm
                 measured_gain = step / delta_dx
                 pan_measurements.append(measured_gain)
-                print(f"   ✓ Rotation {step:+.1f}° → déplacement objet {delta_dx:+.3f} → gain={measured_gain:+.2f}")
+                print(
+                    f"   ✓ Rotation {step:+.1f}° → déplacement objet {delta_dx:+.3f} → gain={measured_gain:+.2f}"
+                )
             else:
                 print(f"   ⚠️  Mouvement trop faible détecté ({delta_dx:+.3f})")
-        
+
         if not pan_measurements:
             print("❌ Impossible de calibrer le PAN (aucune mesure valide)")
             return
-        
+
         gain_pan = sum(pan_measurements) / len(pan_measurements)
         print()
         print(f"✅ Gain PAN calculé: {gain_pan:+.2f} deg/norm")
-        
+
         # Remettre à la position initiale
         with shared.lock:
             shared.target_positions["shoulder_pan"] = initial_pan
         time.sleep(settle_time)
-        
+
         print()
         print("─" * 70)
         print("ÉTAPE 2: Calibration du MOUVEMENT VERTICAL (Y)")
         print("─" * 70)
         print()
-        
+
         with shared.lock:
             y_step = float(shared.settings.follow.calibration_y_step_m)
             initial_y = float(shared.current_y)
             initial_x = float(shared.current_x)
-        
+
         y_measurements = []
-        
+
         for direction in [1, -1, 1]:  # +, -, + pour 3 mesures
             step = y_step * direction
-            
+
             # Mesurer position initiale de l'objet
-            box_before, shape_before = wait_for_stable_detection(shared, min_frames=3, timeout_s=1.5)
+            box_before, shape_before = wait_for_stable_detection(
+                shared, min_frames=3, timeout_s=1.5
+            )
             if box_before is None:
                 print("⚠️  Objet perdu, tentative de récupération...")
                 time.sleep(0.5)
                 continue
-            
-            _, dy_before = box_center_norm(box_before, (shape_before[0], shape_before[1], 3))
-            
+
+            _, dy_before = box_center_norm(
+                box_before, (shape_before[0], shape_before[1], 3)
+            )
+
             # Bouger le robot en Y
-            print(f"   → Déplacement de {step*100:+.1f}cm en Y...")
+            print(f"   → Déplacement de {step * 100:+.1f}cm en Y...")
             with shared.lock:
                 current_y = float(shared.current_y)
                 shared.current_y = current_y + step
                 j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
                 shared.target_positions["shoulder_lift"] = float(j2)
                 shared.target_positions["elbow_flex"] = float(j3)
-            
+
             time.sleep(settle_time)
-            
+
             # Mesurer nouvelle position de l'objet
-            box_after, shape_after = wait_for_stable_detection(shared, min_frames=3, timeout_s=1.5)
+            box_after, shape_after = wait_for_stable_detection(
+                shared, min_frames=3, timeout_s=1.5
+            )
             if box_after is None:
                 print("   ⚠️  Objet perdu après mouvement, annulation de cette mesure")
                 with shared.lock:
@@ -605,10 +667,12 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
                     shared.target_positions["elbow_flex"] = float(j3)
                 time.sleep(settle_time / 2)
                 continue
-            
-            _, dy_after = box_center_norm(box_after, (shape_after[0], shape_after[1], 3))
+
+            _, dy_after = box_center_norm(
+                box_after, (shape_after[0], shape_after[1], 3)
+            )
             delta_dy = dy_after - dy_before
-            
+
             # Revenir à la position initiale
             with shared.lock:
                 shared.current_y = current_y
@@ -616,14 +680,16 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
                 shared.target_positions["shoulder_lift"] = float(j2)
                 shared.target_positions["elbow_flex"] = float(j3)
             time.sleep(settle_time / 2)
-            
+
             if abs(delta_dy) > 0.01:  # Mouvement significatif détecté
                 measured_gain = step / delta_dy
                 y_measurements.append(measured_gain)
-                print(f"   ✓ Mouvement {step*100:+.1f}cm → déplacement objet {delta_dy:+.3f} → gain={measured_gain:+.5f}")
+                print(
+                    f"   ✓ Mouvement {step * 100:+.1f}cm → déplacement objet {delta_dy:+.3f} → gain={measured_gain:+.5f}"
+                )
             else:
                 print(f"   ⚠️  Mouvement trop faible détecté ({delta_dy:+.3f})")
-        
+
         if not y_measurements:
             print("⚠️  Impossible de calibrer le Y (aucune mesure valide)")
             print("   On garde le gain par défaut pour Y")
@@ -632,14 +698,14 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
             gain_y = sum(y_measurements) / len(y_measurements)
             print()
             print(f"✅ Gain Y calculé: {gain_y:+.5f} m/norm")
-        
+
         # Remettre à la position initiale
         with shared.lock:
             shared.current_y = initial_y
             j2, j3 = inverse_kinematics_2d(initial_x, initial_y)
             shared.target_positions["shoulder_lift"] = float(j2)
             shared.target_positions["elbow_flex"] = float(j3)
-        
+
         print()
         print("─" * 70)
         print("RÉSUMÉ DE LA CALIBRATION")
@@ -647,20 +713,20 @@ def run_follow_calibration(robot, shared: SharedState) -> None:
         print(f"   Gain PAN: {gain_pan:+.2f} deg/norm")
         print(f"   Gain Y:   {gain_y:+.5f} m/norm")
         print()
-        
+
         # Sauvegarder les gains
         with shared.lock:
             shared.settings.gains.pan_deg_per_norm = gain_pan
             shared.settings.gains.y_m_per_norm = gain_y
             shared.settings.gains.calibrated = True
-        
+
         save_settings(SETTINGS_PATH, shared.settings)
-        
+
         print("✅ CALIBRATION TERMINÉE - Gains sauvegardés!")
         print()
         print("💡 Conseil: Appuyez sur 'p' pour activer le suivi et tester")
         print()
-        
+
     finally:
         # Restaurer l'état du suivi
         with shared.lock:
@@ -680,7 +746,13 @@ def read_joint_positions_deg(robot) -> Dict[str, float]:
     return joints
 
 
-def goto_pose_blocking(robot, shared: SharedState, target: SavedPose, timeout_s: float = 6.0, threshold_deg: float = 2.0) -> None:
+def goto_pose_blocking(
+    robot,
+    shared: SharedState,
+    target: SavedPose,
+    timeout_s: float = 6.0,
+    threshold_deg: float = 2.0,
+) -> None:
     # Event function: prints are allowed here
     # Temporarily disable follow during goto
     with shared.lock:
@@ -697,7 +769,7 @@ def goto_pose_blocking(robot, shared: SharedState, target: SavedPose, timeout_s:
             # enforce wrist_flex rule
             shared.target_positions["wrist_flex"] = (
                 -float(shared.target_positions["shoulder_lift"])
-                -float(shared.target_positions["elbow_flex"])
+                - float(shared.target_positions["elbow_flex"])
                 + pitch
             )
             targets = dict(shared.target_positions)
@@ -782,6 +854,48 @@ def tune_params_interactive(shared: SharedState) -> None:
 
 
 # -----------------------------
+# Policy inference helper
+# -----------------------------
+def run_policy_inference(
+    robot,
+    events,
+    policy,
+    preprocessor,
+    postprocessor,
+    single_task,
+    dataset=None,
+    fps=30,
+    control_time_s=60,
+    display_data=False,
+) -> bool:
+    """
+    Run one step of policy inference and apply the action to the robot.
+
+    Uses the robot's capture_observation() method which returns data in the
+    format expected by LeRobot policies (matching how training data was recorded).
+
+    Returns True if inference was successful, False otherwise.
+    """
+    if policy is None:
+        print("[POLICY] No policy loaded")
+        return False
+
+    log_say(f"Running policy inference")
+    record_loop(
+        robot=robot,
+        events=events,
+        fps=fps,
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        dataset=dataset,
+        control_time_s=control_time_s,
+        single_task=single_task,
+        display_data=display_data,
+    )
+
+
+# -----------------------------
 # YOLO thread
 # -----------------------------
 def yolo_loop(model: YOLO, cap, class_ids: List[int], shared: SharedState):
@@ -830,49 +944,97 @@ def yolo_loop(model: YOLO, cap, class_ids: List[int], shared: SharedState):
             # Dessiner les indicateurs visuels
             h, w = frame.shape[:2]
             center_x, center_y = w // 2, h // 2
-            
+
             # Dessiner le centre de l'image (croix)
             cross_size = 20
             cross_color = (0, 255, 0) if follow_on else (128, 128, 128)
-            cv2.line(annotated, (center_x - cross_size, center_y), (center_x + cross_size, center_y), cross_color, 2)
-            cv2.line(annotated, (center_x, center_y - cross_size), (center_x, center_y + cross_size), cross_color, 2)
-            
+            cv2.line(
+                annotated,
+                (center_x - cross_size, center_y),
+                (center_x + cross_size, center_y),
+                cross_color,
+                2,
+            )
+            cv2.line(
+                annotated,
+                (center_x, center_y - cross_size),
+                (center_x, center_y + cross_size),
+                cross_color,
+                2,
+            )
+
             # Dessiner la zone morte (deadzone)
             if follow_on:
                 dz_x = int(float(fp.deadzone_x) * w / 2)
                 dz_y = int(float(fp.deadzone_y) * h / 2)
-                cv2.rectangle(annotated, 
-                              (center_x - dz_x, center_y - dz_y), 
-                              (center_x + dz_x, center_y + dz_y), 
-                              (0, 255, 255), 1)
-            
+                cv2.rectangle(
+                    annotated,
+                    (center_x - dz_x, center_y - dz_y),
+                    (center_x + dz_x, center_y + dz_y),
+                    (0, 255, 255),
+                    1,
+                )
+
             # Indicateur de suivi ON/OFF
             status_text = "FOLLOW: ON" if follow_on else "FOLLOW: OFF"
             status_color = (0, 255, 0) if follow_on else (0, 0, 255)
-            cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-            
+            cv2.putText(
+                annotated,
+                status_text,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                status_color,
+                2,
+            )
+
             # Si suivi actif, dessiner la direction de correction
             if follow_on and best_box is not None:
                 dx_norm, dy_norm = box_center_norm(best_box, frame.shape)
-                
+
                 # Centre de l'objet détecté
                 obj_cx = int((best_box[0] + best_box[2]) / 2)
                 obj_cy = int((best_box[1] + best_box[3]) / 2)
-                
+
                 # Dessiner un cercle sur l'objet suivi
                 cv2.circle(annotated, (obj_cx, obj_cy), 8, (255, 0, 255), -1)
-                
+
                 # Dessiner une flèche du centre vers l'objet (direction que le robot doit compenser)
-                if abs(dx_norm) >= float(fp.deadzone_x) or abs(dy_norm) >= float(fp.deadzone_y):
+                if abs(dx_norm) >= float(fp.deadzone_x) or abs(dy_norm) >= float(
+                    fp.deadzone_y
+                ):
                     arrow_color = (0, 165, 255)  # Orange
-                    cv2.arrowedLine(annotated, (center_x, center_y), (obj_cx, obj_cy), arrow_color, 2, tipLength=0.1)
-                    
+                    cv2.arrowedLine(
+                        annotated,
+                        (center_x, center_y),
+                        (obj_cx, obj_cy),
+                        arrow_color,
+                        2,
+                        tipLength=0.1,
+                    )
+
                     # Afficher l'erreur
                     error_text = f"dx:{dx_norm:+.2f} dy:{dy_norm:+.2f}"
-                    cv2.putText(annotated, error_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(
+                        annotated,
+                        error_text,
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
             elif follow_on and best_box is None:
                 # Aucun objet détecté
-                cv2.putText(annotated, "NO TARGET", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(
+                    annotated,
+                    "NO TARGET",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
 
             # Follow control: center object in frame
             if follow_on and best_box is not None:
@@ -886,17 +1048,28 @@ def yolo_loop(model: YOLO, cap, class_ids: List[int], shared: SharedState):
                 delta_pan_deg = float(gains.pan_deg_per_norm) * dx_norm
                 delta_y_m = float(gains.y_m_per_norm) * dy_norm
 
-                delta_pan_deg = clamp(delta_pan_deg, -float(fp.pan_max_deg_per_frame), float(fp.pan_max_deg_per_frame))
-                delta_y_m = clamp(delta_y_m, -float(fp.y_max_m_per_frame), float(fp.y_max_m_per_frame))
+                delta_pan_deg = clamp(
+                    delta_pan_deg,
+                    -float(fp.pan_max_deg_per_frame),
+                    float(fp.pan_max_deg_per_frame),
+                )
+                delta_y_m = clamp(
+                    delta_y_m, -float(fp.y_max_m_per_frame), float(fp.y_max_m_per_frame)
+                )
 
                 did_move = (abs(delta_pan_deg) > 1e-4) or (abs(delta_y_m) > 1e-6)
 
                 if did_move:
                     with shared.lock:
-                        shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] - 0.15 * delta_pan_deg)
+                        shared.target_positions["shoulder_pan"] = float(
+                            shared.target_positions["shoulder_pan"]
+                            - 0.15 * delta_pan_deg
+                        )
 
                         shared.current_y = float(shared.current_y + delta_y_m)
-                        j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                        j2, j3 = inverse_kinematics_2d(
+                            shared.current_x, shared.current_y
+                        )
                         shared.target_positions["shoulder_lift"] = float(j2)
                         shared.target_positions["elbow_flex"] = float(j3)
 
@@ -904,7 +1077,9 @@ def yolo_loop(model: YOLO, cap, class_ids: List[int], shared: SharedState):
                     t = now_ts()
                     if t - last_follow_print_ts > 0.12:
                         last_follow_print_ts = t
-                        print(f"[FOLLOW] pan {delta_pan_deg:+.2f}deg, y {delta_y_m:+.4f}m, dx={dx_norm:+.2f}, dy={dy_norm:+.2f}")
+                        print(
+                            f"[FOLLOW] pan {delta_pan_deg:+.2f}deg, y {delta_y_m:+.4f}m, dx={dx_norm:+.2f}, dy={dy_norm:+.2f}"
+                        )
 
             # Show window, ESC only to quit
             cv2.imshow("YOLO Live Detection", annotated)
@@ -937,7 +1112,21 @@ def is_arrow(key: str, keyset: set) -> bool:
 # -----------------------------
 # Main P-control loop
 # -----------------------------
-def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[str, float]):
+def p_control_loop(
+    robot,
+    keyboard,
+    shared: SharedState,
+    start_positions: Dict[str, float],
+    events,
+    preprocessor,
+    postprocessor,
+    single_task=SINGLE_TASK,
+    display_data=False,
+    control_time_s=60,
+    fps=30,
+    dataset=None,
+    policy=None,
+):
     joint_controls = {
         "a": ("shoulder_pan", -1.0),
         "d": ("shoulder_pan", 1.0),
@@ -967,7 +1156,10 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
                         current_time = now_ts()
                         with shared.lock:
                             # Vérifier le debounce
-                            if current_time - shared.last_p_press_time < shared.p_debounce_delay:
+                            if (
+                                current_time - shared.last_p_press_time
+                                < shared.p_debounce_delay
+                            ):
                                 continue  # Ignorer, touche encore enfoncée
                             shared.last_p_press_time = current_time
                             shared.follow_enabled = not shared.follow_enabled
@@ -1030,6 +1222,26 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
                         print(f"[KEY] pitch {p:+.1f}deg")
                         continue
 
+                    # Policy inference
+                    if k == "b":
+                        if policy is None:
+                            print("[KEY] No policy loaded - cannot run inference")
+                        else:
+                            print("[KEY] Running policy inference...")
+                            run_policy_inference(
+                                robot,
+                                events,
+                                policy,
+                                preprocessor,
+                                postprocessor,
+                                single_task,
+                                dataset,
+                                fps,
+                                control_time_s,
+                                display_data,
+                            )
+                        continue
+
                     # Joint direct controls
                     if k in joint_controls:
                         jname, delta = joint_controls[k]
@@ -1048,7 +1260,9 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
                     if is_arrow(k, LEFT_KEYS):
                         with shared.lock:
                             shared.current_x -= step
-                            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                            j2, j3 = inverse_kinematics_2d(
+                                shared.current_x, shared.current_y
+                            )
                             shared.target_positions["shoulder_lift"] = float(j2)
                             shared.target_positions["elbow_flex"] = float(j3)
                             cx, cy = shared.current_x, shared.current_y
@@ -1057,7 +1271,9 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
                     elif is_arrow(k, RIGHT_KEYS):
                         with shared.lock:
                             shared.current_x += step
-                            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                            j2, j3 = inverse_kinematics_2d(
+                                shared.current_x, shared.current_y
+                            )
                             shared.target_positions["shoulder_lift"] = float(j2)
                             shared.target_positions["elbow_flex"] = float(j3)
                             cx, cy = shared.current_x, shared.current_y
@@ -1066,7 +1282,9 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
                     elif is_arrow(k, UP_KEYS):
                         with shared.lock:
                             shared.current_y -= step
-                            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                            j2, j3 = inverse_kinematics_2d(
+                                shared.current_x, shared.current_y
+                            )
                             shared.target_positions["shoulder_lift"] = float(j2)
                             shared.target_positions["elbow_flex"] = float(j3)
                             cx, cy = shared.current_x, shared.current_y
@@ -1075,14 +1293,18 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
                     elif is_arrow(k, DOWN_KEYS):
                         with shared.lock:
                             shared.current_y += step
-                            j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
+                            j2, j3 = inverse_kinematics_2d(
+                                shared.current_x, shared.current_y
+                            )
                             shared.target_positions["shoulder_lift"] = float(j2)
                             shared.target_positions["elbow_flex"] = float(j3)
                             cx, cy = shared.current_x, shared.current_y
                         moved_ee = True
 
                     if moved_ee:
-                        print(f"[KEY] EE x={cx:.4f} y={cy:.4f} -> shoulder_lift={j2:.2f} elbow_flex={j3:.2f}")
+                        print(
+                            f"[KEY] EE x={cx:.4f} y={cy:.4f} -> shoulder_lift={j2:.2f} elbow_flex={j3:.2f}"
+                        )
                         continue
 
             # P-control tick
@@ -1094,7 +1316,7 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
                 # wrist_flex rule
                 shared.target_positions["wrist_flex"] = (
                     -float(shared.target_positions["shoulder_lift"])
-                    -float(shared.target_positions["elbow_flex"])
+                    - float(shared.target_positions["elbow_flex"])
                     + pitch
                 )
                 targets = dict(shared.target_positions)
@@ -1129,7 +1351,9 @@ def p_control_loop(robot, keyboard, shared: SharedState, start_positions: Dict[s
     try:
         # quick return using same kp/freq
         t0 = now_ts()
-        while (now_ts() - t0) < 5.0 and start_positions and not shared.stop_event.is_set():
+        while (
+            (now_ts() - t0) < 5.0 and start_positions and not shared.stop_event.is_set()
+        ):
             with shared.lock:
                 cf = int(shared.settings.control.control_freq)
                 kp = float(shared.settings.control.kp)
@@ -1182,7 +1406,7 @@ def main():
     print("║" + "SO101 YOLO FOLLOW - Robot Tracking System".center(68) + "║")
     print("╚" + "=" * 68 + "╝")
     print()
-    
+
     settings = load_settings(SETTINGS_PATH)
     shared = SharedState(settings)
 
@@ -1195,7 +1419,10 @@ def main():
         try:
             from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
         except Exception:
-            from lerobot.common.robots.so101_follower import SO101Follower, SO101FollowerConfig
+            from lerobot.common.robots.so101_follower import (
+                SO101Follower,
+                SO101FollowerConfig,
+            )
 
         from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
 
@@ -1203,8 +1430,13 @@ def main():
         print("─" * 70)
         print("CONFIGURATION DU ROBOT")
         print("─" * 70)
-        port = input("SO101 robot USB port (default /dev/ttyACM1): ").strip() or "/dev/ttyACM1"
-        robot_id = input("Robot id (default SO101_follower): ").strip() or "SO101_follower"
+        port = (
+            input("SO101 robot USB port (default /dev/ttyACM1): ").strip()
+            or "/dev/ttyACM1"
+        )
+        robot_id = (
+            input("Robot id (default SO101_follower): ").strip() or "SO101_follower"
+        )
         print()
 
         robot_config = SO101FollowerConfig(port=port, id=robot_id, use_degrees=True)
@@ -1212,15 +1444,41 @@ def main():
 
         keyboard = KeyboardTeleop(KeyboardTeleopConfig())
 
+        # Load pretrained policy
+        print("─" * 70)
+        print("CHARGEMENT DE LA POLITIQUE PRÉ-ENTRAÎNÉE")
+        print("─" * 70)
+        policy = None
+
+        print(f"Chargement depuis: {PRETRAINED_POLICY_PATH}")
+        policy = PI05Policy.from_pretrained(PRETRAINED_POLICY_PATH)
+
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            policy.to("cuda")
+            print("✅ Politique chargée sur GPU (CUDA)")
+        else:
+            policy.to("cpu")
+            print("⚠️ CUDA non disponible, politique chargée sur CPU")
+
+        # TODO(Clement): Do we really need that? What is it for?
+        _, events = init_keyboard_listener()
+        init_rerun(session_name="recording")
+
         robot.connect()
         keyboard.connect()
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy,
+            pretrained_path=PRETRAINED_POLICY_PATH,
+        )
 
         # Read start positions
         start_positions = read_joint_positions_deg(robot)
 
         # YOLO model
         model = YOLO(settings.yolo.model_path)
-        
+
         # Configuration de l'objet à suivre
         print("─" * 70)
         print("CONFIGURATION DE L'OBJET À SUIVRE")
@@ -1243,11 +1501,15 @@ def main():
         print("  oven, toaster, sink, refrigerator, book, clock, vase,")
         print("  scissors, teddy bear, hair drier, toothbrush")
         print()
-        new_target = input(f"Entrez l'objet à suivre (ENTRÉE pour garder '{', '.join(current_targets)}'): ").strip()
-        
+        new_target = input(
+            f"Entrez l'objet à suivre (ENTRÉE pour garder '{', '.join(current_targets)}'): "
+        ).strip()
+
         if new_target:
             # Permettre plusieurs objets séparés par des virgules
-            new_targets = [t.strip().lower() for t in new_target.split(",") if t.strip()]
+            new_targets = [
+                t.strip().lower() for t in new_target.split(",") if t.strip()
+            ]
             if new_targets:
                 settings.yolo.target_objects = new_targets
                 save_settings(SETTINGS_PATH, settings)
@@ -1259,9 +1521,11 @@ def main():
         # Determine target classes from settings
         target_objects = normalize_target_names(settings.yolo.target_objects or ["cup"])
         class_ids = get_class_ids_from_names(model, target_objects)
-        
+
         if not class_ids:
-            print(f"⚠️  ATTENTION: Aucun objet '{', '.join(settings.yolo.target_objects)}' trouvé dans le modèle COCO!")
+            print(
+                f"⚠️  ATTENTION: Aucun objet '{', '.join(settings.yolo.target_objects)}' trouvé dans le modèle COCO!"
+            )
             print("   Le suivi ne fonctionnera pas. Vérifiez l'orthographe.")
             print()
 
@@ -1292,6 +1556,7 @@ def main():
         print("─" * 70)
         print("  p     : Activer/Désactiver le mode SUIVI")
         print("  c     : Lancer la CALIBRATION du suivi")
+        print("  b     : Exécuter une inférence de la POLITIQUE")
         print("  k     : Modifier les paramètres de contrôle")
         print("  ESC   : Quitter")
         print()
@@ -1309,18 +1574,36 @@ def main():
         print("  i     : Aller à la pose sauvegardée")
         print()
         print("─" * 70)
-        print(f"État du suivi: {'CALIBRÉ' if settings.gains.calibrated else 'NON CALIBRÉ (appuyez sur c)'}")
+        print(
+            f"État du suivi: {'CALIBRÉ' if settings.gains.calibrated else 'NON CALIBRÉ (appuyez sur c)'}"
+        )
+        print(
+            f"État de la politique: {'CHARGÉE ✅' if policy is not None else 'NON CHARGÉE ❌'}"
+        )
         print("─" * 70)
         print()
-        print("🚀 Démarrage... (appuyez sur 'p' pour activer le suivi)")
+        print(
+            "🚀 Démarrage... (appuyez sur 'p' pour activer le suivi, 'b' pour inférence)"
+        )
         print()
 
         # Start YOLO thread
-        yolo_thread = threading.Thread(target=yolo_loop, args=(model, cap, class_ids, shared), daemon=True)
+        yolo_thread = threading.Thread(
+            target=yolo_loop, args=(model, cap, class_ids, shared), daemon=True
+        )
         yolo_thread.start()
 
         # Run control loop
-        p_control_loop(robot, keyboard, shared, start_positions)
+        p_control_loop(
+            robot,
+            keyboard,
+            shared,
+            start_positions,
+            events,
+            preprocessor,
+            postprocessor,
+            policy=policy,
+        )
 
     except Exception:
         # Keep this quiet-ish (no stacktrace spam)
