@@ -28,8 +28,8 @@ logger = logging.getLogger("so101_yolo_follow")
 # Tuning knobs (safe-ish defaults)
 # =========================
 
-CONTROL_FREQ = 50
-KP = 0.5
+CONTROL_FREQ = 20
+KP = 0.3
 
 # Keyboard EE step (meters)
 EE_STEP = 0.004
@@ -122,7 +122,7 @@ def inverse_kinematics_2d(x, y, l1=0.1159, l2=0.1350):
 # =========================
 # Motion helpers
 # =========================
-def move_to_zero_position(robot, stop_event: threading.Event, duration=3.0, kp=0.5, control_freq=50):
+def move_to_zero_position(robot, stop_event: threading.Event, duration=3.0, kp=0.5, control_freq=CONTROL_FREQ):
     zero_positions = {
         "shoulder_pan": 0.0,
         "shoulder_lift": 0.0,
@@ -158,7 +158,7 @@ def move_to_zero_position(robot, stop_event: threading.Event, duration=3.0, kp=0
 
         time.sleep(step_time)
 
-def return_to_start_position(robot, stop_event: threading.Event, start_positions, kp=0.2, control_freq=50):
+def return_to_start_position(robot, stop_event: threading.Event, start_positions, kp=0.2, control_freq=CONTROL_FREQ):
     control_period = 1.0 / control_freq
     max_steps = int(5.0 * control_freq)
 
