@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "control": {
+    "control_freq": 20,
+    "kp": 0.3,
+    "ee_step": 0.004,
+    "pitch_step": 1.0
+  },
+  "yolo": {
+    "model_path": "yolo11x.pt",
+    "imgsz": 960,
+    "conf": 0.15,
+    "iou": 0.7,
+    "target_objects": [
+      "cup"
+    ],
+    "camera_index": 4
+  },
+  "follow": {
+    "deadzone_x": 0.08,
+    "deadzone_y": 0.08,
+    "pan_max_deg_per_frame": 2.5,
+    "y_max_m_per_frame": 0.004
+  },
+  "gains": {
+    "pan_deg_per_norm": 3.0,
+    "y_m_per_norm": -0.008,
+    "calibrated": false
+  },
+  "voice": {
+    "sample_rate": 16000,
+    "vad_start_db": -19.0,
+    "vad_end_db": -24.0,
+    "vad_frame_ms": 20,
+    "vad_preroll_ms": 250,
+    "vad_end_silence_ms": 600,
+    "vad_max_record_s": 15.0,
+    "vad_required_start_frames": 3,
+    "llm_model": "gpt-4.1",
+    "stt_model": "gpt-4o-transcribe",
+    "tts_model": "gpt-4o-mini-tts",
+    "tts_voice": "coral"
+  }
+}
