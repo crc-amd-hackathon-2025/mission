@@ -29,8 +29,7 @@ Real world application: Content creation assistance (see summary above for detai
 
 - ![Teleoperation / Dataset capture](assets/demo-teleop.gif)
 - *Training*: Please refer to [the dedicated Jupyter notebook](https://github.com/crc-amd-hackathon-2025/mission/blob/main/mission/code/training-models-on-rocm.ipynb) (`mission/code/training-models-on-rocm.ipynb`) for the full training pipeline (dataset download, training, artifact upload).
-- *Inference*
-    - **TODO**: Image/video of inference eval
+- [Inference](https://drive.google.com/file/d/1LGHCudfnFP8nU68_FdeQEsamhHWYAEHp/view)
 
 ### 4. Ease of use
 - *How generalizable is your implementation across tasks or environments?*: The system can grab the camera from various positions (as long as it is within reach) and can track different types of targets (people, objects).
