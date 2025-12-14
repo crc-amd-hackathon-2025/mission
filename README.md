@@ -1,6 +1,4 @@
-**### Make a fork or copy of this repo and fill in your team submission details! ###**
-
-# AMD_Robotics_Hackathon_2025_[Project Name]
+# AMD Robotics Hackathon 2025 | CRC Assistant
 
 ## Team Information
 
@@ -28,8 +26,9 @@ Real world application: Content creation assistance (see summary above for detai
 - *Innovation in design, methodology, or application*: A content creator does not need to manually operate the camera, nor does he need to hire a cameraman, as the robot can autonomously handle camera positioning and tracking based on voice commands.
 
 ### 3. Technical implementations
-- [Teleoperation / Dataset capture](https://drive.google.com/file/d/11nWlYSwXZ_8sMyLyyOxRiGxJGFHO1Qrr/view)
-- *Training*: Please refer to [the dedicated Jupyter notebook](https://github.com/crc-amd-hackathon-2025/mission/blob/main/mission/code/training-models-on-rocm.ipynb) for training details.
+
+- ![Teleoperation / Dataset capture](assets/demo-teleop.gif)
+- *Training*: Please refer to [the dedicated Jupyter notebook](https://github.com/crc-amd-hackathon-2025/mission/blob/main/mission/code/training-models-on-rocm.ipynb) (`mission/code/training-models-on-rocm.ipynb`) for the full training pipeline (dataset download, training, artifact upload).
 - *Inference*
     - **TODO**: Image/video of inference eval
 
@@ -87,8 +86,3 @@ outputs/train/smolvla_so101_2cube_30k_steps/wandb/
     └── tmp
         └── code
 ```
-
-**NOTES**
-
-1. The `latest-run` is the soft link, please make sure to copy the real target directory it linked with all sub dirs and files.
-2. Only provide (upload) the wandb of your last success pre-trained model for the Mission.
