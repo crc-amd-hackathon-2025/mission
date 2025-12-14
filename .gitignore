@@ -6,3 +6,4 @@ mission/code/outputs/
 so101_yolo_follow_settings.json
 __pycache__
 mission/code/.env
+mission/code/_tmp_audio

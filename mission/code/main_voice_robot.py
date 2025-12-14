@@ -560,7 +560,7 @@ def main():
         except Exception:
             from lerobot.common.robots.so101_follower import SO101Follower, SO101FollowerConfig
         
-        from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+        # from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
         
         # Robot configuration
         print("─" * 70)
@@ -571,12 +571,13 @@ def main():
         print()
         
         # Camera configuration for robot
-        cameras_config = {
-            "wrist": OpenCVCameraConfig(index_or_path=3, width=640, height=480, fps=30),
-            "top": OpenCVCameraConfig(index_or_path=4, width=640, height=480, fps=30),
-        }
+        # cameras_config = {
+        #     "wrist": OpenCVCameraConfig(index_or_path=4, width=640, height=480, fps=30),
+        #     "top": OpenCVCameraConfig(index_or_path=2, width=640, height=480, fps=30),
+        # }
         
-        robot_config = SO101FollowerConfig(port=port, id=robot_id, cameras=cameras_config, use_degrees=True)
+        # robot_config = SO101FollowerConfig(port=port, id=robot_id, cameras=cameras_config, use_degrees=True)
+        robot_config = SO101FollowerConfig(port=port, id=robot_id, use_degrees=True)
         robot = SO101Follower(robot_config)
         robot.connect()
         
@@ -627,10 +628,11 @@ def main():
         
         # Load pretrained policy (optional)
         print("─" * 70)
-        print("PRETRAINED POLICY")
+        print("PRETRAINED POLICY (disqbled)")
         print("─" * 70)
         policy = None
         try:
+            raise 'Implementation error'
             from lerobot.policies.pi05.modeling_pi05 import PI05Policy
             from lerobot.policies.factory import make_pre_post_processors
             
