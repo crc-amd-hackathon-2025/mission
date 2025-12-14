@@ -6,15 +6,13 @@
 - ID: 1
 - Name: CRC
 - Members:
-    - Cedric
-    - Remy
-    - Clement
+    - Cedric Brzyski
+    - Remy Sihaan--Gen--Sollen
+    - Clement Verrier
 
 **Summary:** Content Creator Assistant
 
 Our work focuses on developing a robotic system that can assist content creators in recording videos: the robot is capable of grabbing a camera, then pointing it towards a specific target (*e.g.*, a person), focusing on it while maintaining a stable shot, and following the target as it moves. Moreover, the robot is controlled through voice commands, allowing for a hands-free experience. This system aims to enhance the content creation process by providing dynamic and adaptive camera work, enabling creators to focus on their performance without worrying about camera operation.
-
-**TODO**: Images or video demonstrating your project
 
 ## Submission Details
 
@@ -29,7 +27,7 @@ Real world application: Content creation assistance (see summary above for detai
 
 - ![Teleoperation / Dataset capture](assets/demo-teleop.gif)
 - *Training*: Please refer to [the dedicated Jupyter notebook](https://github.com/crc-amd-hackathon-2025/mission/blob/main/mission/code/training-models-on-rocm.ipynb) (`mission/code/training-models-on-rocm.ipynb`) for the full training pipeline (dataset download, training, artifact upload).
-- [Inference](https://drive.google.com/file/d/1LGHCudfnFP8nU68_FdeQEsamhHWYAEHp/view)
+- [Inference](https://drive.google.com/file/d/1LGHCudfnFP8nU68_FdeQEsamhHWYAEHp/view) (playback speed: x2)
 
 ### 4. Ease of use
 - *How generalizable is your implementation across tasks or environments?*: The system can grab the camera from various positions (as long as it is within reach) and can track different types of targets (people, objects).
