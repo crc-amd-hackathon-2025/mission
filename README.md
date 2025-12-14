@@ -6,9 +6,9 @@
 - ID: 1
 - Name: CRC
 - Members:
-    - Cedric
-    - Remy
-    - Clement
+    - Cedric Brzyski
+    - Remy Sihaan--Gen--Sollen
+    - Clement Verrier
 
 **Summary:** Content Creator Assistant
 
