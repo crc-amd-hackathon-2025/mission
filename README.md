@@ -28,9 +28,11 @@ Real world application: Content creation assistance (see summary above for detai
 - *Innovation in design, methodology, or application*: A content creator does not need to manually operate the camera, nor does he need to hire a cameraman, as the robot can autonomously handle camera positioning and tracking based on voice commands.
 
 ### 3. Technical implementations
-- *Teleoperation / Dataset capture*
-    - *<Image/video of teleoperation or dataset capture>*
-- *Training*: **TODO**: add link to the training notebook
+- *Teleoperation / Dataset capture*:
+<video controls width="640" height="360">
+  <source src="assets/demo_teleop.webm" type="video/webm">
+</video>
+- *Training*: For full details about the training procedure, please refer to [the dedicated Jupyter notebook](https://github.com/crc-amd-hackathon-2025/mission/blob/main/mission/code/training-models-on-rocm.ipynb).
 - *Inference*
     - **TODO**: Image/video of inference eval
 
