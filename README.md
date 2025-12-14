@@ -12,38 +12,41 @@
     - Remy
     - Clement
 
-**Summary:** *A brief description of your work*
+**Summary:** Content Creator Assistant
 
-*< Images or video demonstrating your project >*
+Our work focuses on developing a robotic system that can assist content creators in recording videos: the robot is capable of grabbing a camera, then pointing it towards a specific target (*e.g.*, a person), focusing on it while maintaining a stable shot, and following the target as it moves. Moreover, the robot is controlled through voice commands, allowing for a hands-free experience. This system aims to enhance the content creation process by providing dynamic and adaptive camera work, enabling creators to focus on their performance without worrying about camera operation.
+
+**TODO**: Images or video demonstrating your project
 
 ## Submission Details
 
 ### 1. Mission Description
-- *Real world application of your mission*
+Real world application: Content creation assistance (see summary above for details).
 
 ### 2. Creativity
-- *What is novel or unique in your approach?*
-- *Innovation in design, methodology, or application*
+- *What is novel or unique in your approach?* We combine voice command recognition with real-time object tracking to create a hands-free camera operation system.
+- *Innovation in design, methodology, or application*: A content creator does not need to manually operate the camera, nor does he need to hire a cameraman, as the robot can autonomously handle camera positioning and tracking based on voice commands.
 
 ### 3. Technical implementations
 - *Teleoperation / Dataset capture*
     - *<Image/video of teleoperation or dataset capture>*
-- *Training*
+- *Training*: **TODO**: add link to the training notebook
 - *Inference*
-    - *<Image/video of inference eval>*
+    - **TODO**: Image/video of inference eval
 
 ### 4. Ease of use
-- *How generalizable is your implementation across tasks or environments?*
-- *Flexibility and adaptability of the solution*
-- *Types of commands or interfaces needed to control the robot*
+- *How generalizable is your implementation across tasks or environments?*: The system can grab the camera from various positions (as long as it is within reach) and can track different types of targets (people, objects).
+- *Flexibility and adaptability of the solution*: The voice command interface allows users to easily switch targets.
+- *Types of commands or interfaces needed to control the robot*: Voice commands.
+
+Besides, the YOLO-based tracking system requires an additional calibrations: we implemented an automatic calibration tool. The results are stored in a JSON configuration file that can easily be shared and is automatically loaded at restart. 
 
 ## Additional Links
 *For example, you can provide links to:*
 
 - *Link to a video of your robot performing the task*
-- *URL of your dataset in Hugging Face*
-- *URL of your model in Hugging Face*
-- *Link to a blog post describing your work*
+- *URL of your dataset in Hugging Face*: https://huggingface.co/datasets/crc-amd-hackathon-2025/grab-cam
+- *URL of your model in Hugging Face*: **TODO**: add link to the policy model
 
 ## Code submission
 
