@@ -42,7 +42,7 @@ Besides, the YOLO-based tracking system requires an additional calibrations: we 
 *For example, you can provide links to:*
 
 - *Link to a video of your robot performing the task*
-- *URL of your dataset in Hugging Face*: https://huggingface.co/datasets/crc-amd-hackathon-2025/grab-cam
+- [Dataset in Hugging Face Hub](https://huggingface.co/datasets/crc-amd-hackathon-2025/grab-cam)
 - *URL of your model in Hugging Face*: **TODO**: add link to the policy model
 
 ## Code submission
