@@ -238,7 +238,7 @@ class RobotController:
                 "new_y": self.state.current_y,
             }
     
-    def head_turn(self, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None) -> Dict[str, Any]:
+    def head_turn(self, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None, invert = False) -> Dict[str, Any]:
         """
         Rotate the robot head/camera (shoulder_pan).
         
@@ -269,6 +269,8 @@ class RobotController:
         
         # Apply direction (left = positive, right = negative for shoulder_pan)
         if direction == "right":
+            step = -step
+        if invert:
             step = -step
         
         with self.lock:
@@ -366,7 +368,7 @@ class RobotController:
                 "new_pitch_deg": self.state.pitch,
             }
     
-    def wrist_roll(self, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None) -> Dict[str, Any]:
+    def wrist_roll(self, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None, invert = False) -> Dict[str, Any]:
         """
         Rotate the wrist roll joint.
         
@@ -395,6 +397,8 @@ class RobotController:
         step = max(1.0, min(45.0, step))
         
         if direction == "left":
+            step = -step
+        if invert:
             step = -step
         
         with self.lock:

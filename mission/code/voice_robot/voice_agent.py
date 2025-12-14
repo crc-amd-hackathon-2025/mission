@@ -231,13 +231,16 @@ You have a cheerful personality and enjoy helping users interact with the robot.
 - Stop all movements
 - Exit the program
 
+## Tracking
+For tracking, ask the user to specify an object to track. Call the tool with a COCO label like "cup" or "person".
+
 ## Movement Conventions:
 - `amount`: A float value between 0.0 and 1.0 where:
-  - 0.1 = very small movement (~5mm or ~3 degrees)
-  - 0.3 = small movement (~15mm or ~10 degrees)  
-  - 0.5 = medium movement (~25mm or ~15 degrees)
-  - 0.7 = large movement (~35mm or ~25 degrees)
-  - 1.0 = maximum movement (~50mm or ~35 degrees)
+  - 0.1 = very small movement
+  - 0.3 = small movement  
+  - 0.5 = medium movement
+  - 0.7 = large movement
+  - 1.0 = maximum movement
 - EE axes: x = forward/backward, y = up/down
 - direction: "positive" or "negative" for linear axes, "left" or "right" for rotations
 - gripper: "open" or "close"
@@ -255,7 +258,7 @@ You have a cheerful personality and enjoy helping users interact with the robot.
 
 4. After each action, briefly confirm what you did.
 
-5. Be friendly and conversational! You're CRC Assistant, and you enjoy your job.
+5. Be friendly but don't talk much, keep it short! You're CRC Assistant, and you enjoy your job.
 
 ## Saved Positions:
 {saved_positions}
@@ -449,7 +452,7 @@ class VoiceRobotAgent:
                     "properties": {
                         "object_name": {
                             "type": "string",
-                            "description": "Name of the object to track (e.g., cup, person, bottle, cell phone)"
+                            "description": "Name of the object to track (e.g., cup, person, bottle, cell phone). It should be a COCO label."
                         }
                     },
                     "required": ["object_name"],
@@ -589,11 +592,11 @@ class VoiceRobotAgent:
         # Convert float amount to appropriate step size
         def get_linear_step(amount: float) -> float:
             """Convert 0-1 amount to meters (0.005 to 0.05m)."""
-            return 0.005 + amount * 0.045  # 5mm to 50mm
+            return 0.005 + amount * 1  # 5mm to 50mm
         
         def get_rotation_step(amount: float) -> float:
             """Convert 0-1 amount to degrees (3 to 35 degrees)."""
-            return 3.0 + amount * 32.0  # 3° to 35°
+            return 3.0 + amount * 80.0  # 3° to 35°
         
         # Map tool names to RobotController methods
         if name == "move_ee":
@@ -610,7 +613,8 @@ class VoiceRobotAgent:
             step = get_rotation_step(amount)
             return self.robot.head_turn(
                 direction=args["direction"],
-                step_size=step
+                step_size=step,
+                invert=True
             )
         
         elif name == "gripper":
@@ -629,7 +633,8 @@ class VoiceRobotAgent:
             step = get_rotation_step(amount)
             return self.robot.wrist_roll(
                 direction=args["direction"],
-                step_size=step
+                step_size=step,
+                invert=True
             )
         
         elif name == "start_tracking":

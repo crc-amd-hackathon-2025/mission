@@ -429,7 +429,7 @@ def yolo_loop(model: YOLO, cap, shared: SharedState, controller: RobotController
                         cv2.arrowedLine(annotated, (center_x, center_y), (obj_cx, obj_cy), (0, 165, 255), 2, tipLength=0.1)
                     
                     with shared.lock:
-                        shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] - 0.15 * delta_pan_deg)
+                        shared.target_positions["shoulder_pan"] = float(shared.target_positions["shoulder_pan"] + 0.15 * delta_pan_deg)
                         shared.current_y = float(shared.current_y + delta_y_m)
                         j2, j3 = inverse_kinematics_2d(shared.current_x, shared.current_y)
                         shared.target_positions["shoulder_lift"] = float(j2)
@@ -566,7 +566,7 @@ def main():
         print("─" * 70)
         print("ROBOT CONFIGURATION")
         print("─" * 70)
-        port = input("SO101 robot USB port (default /dev/ttyACM1): ").strip() or "/dev/ttyACM1"
+        port = input("SO101 robot USB port (default /dev/ttyACM0): ").strip() or "/dev/ttyACM0"
         robot_id = input("Robot id (default SO101_follower): ").strip() or "SO101_follower"
         print()
         
@@ -737,7 +737,7 @@ def main():
         voice_runner.start()
         
         print("🎤 CRC Assistant is ready! Speak to control the robot.")
-        print("   (Type /help for all commands, /keyboard for keyboard mode)")
+        print("   (Type /help for all commands, /keyboard for keyboard mode, /text for text mode)")
         print()
         
         # Main loop - handle stdin for text commands

@@ -12,7 +12,7 @@
     "conf": 0.15,
     "iou": 0.7,
     "target_objects": [
-      "cup"
+      "person"
     ],
     "camera_index": 4
   },
@@ -29,8 +29,8 @@
   },
   "voice": {
     "sample_rate": 16000,
-    "vad_start_db": -19.0,
-    "vad_end_db": -24.0,
+    "vad_start_db": -18.0,
+    "vad_end_db": -22.0,
     "vad_frame_ms": 20,
     "vad_preroll_ms": 250,
     "vad_end_silence_ms": 600,
