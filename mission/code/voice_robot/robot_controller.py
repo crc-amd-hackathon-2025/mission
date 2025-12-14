@@ -175,7 +175,7 @@ class RobotController:
         Move the end-effector along an axis.
         
         Args:
-            axis: "x", "y", or "z" (x=left/right, y=up/down, z=forward/backward)
+            axis: "x" or "y" (x=forward/backward, y=up/down)
             direction: "positive" or "negative"
             step_size: Step size in meters (0.005 to 0.05 typical). If provided, overrides amount.
             amount: DEPRECATED - "un_peu" (small) or "beaucoup" (large). Use step_size instead.
@@ -205,17 +205,15 @@ class RobotController:
             step = -step
         
         with self.lock:
-            # For SO101, we use 2D IK:
-            # - x axis: moves current_x (horizontal reach)
-            # - y axis: moves current_y (vertical)
-            # - z axis: same as y for this arm (forward/back)
+            # For SO101, we use 2D IK in a planar arm:
+            # - x axis: forward/backward (horizontal reach distance)
+            # - y axis: up/down (vertical height)
             
             if axis == "x":
+                # Forward/backward movement
                 self.state.current_x += step
             elif axis == "y":
-                self.state.current_y += step
-            elif axis == "z":
-                # Z maps to forward/backward, which is similar to Y in our 2D plane
+                # Up/down movement
                 self.state.current_y += step
             
             # Compute IK
