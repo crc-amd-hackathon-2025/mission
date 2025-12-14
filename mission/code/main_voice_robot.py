@@ -657,14 +657,21 @@ def main():
         
         # Initialize voice agent
         print("─" * 70)
-        print("VOICE AGENT")
+        print("CRC ASSISTANT - VOICE AGENT")
         print("─" * 70)
+        
+        # Exit callback
+        def on_exit_request():
+            print("[SYS] Exit requested by CRC Assistant...")
+            shared.stop_event.set()
+        
         voice_agent = VoiceRobotAgent(
             robot_controller=controller,
             llm_model=settings.voice.llm_model,
             stt_model=settings.voice.stt_model,
             tts_model=settings.voice.tts_model,
             tts_voice=settings.voice.tts_voice,
+            on_exit_request=on_exit_request,
         )
         
         voice_runner = VoiceLoopRunner(
@@ -677,37 +684,39 @@ def main():
             vad_end_silence_ms=settings.voice.vad_end_silence_ms,
             vad_max_record_s=settings.voice.vad_max_record_s,
             vad_required_start_frames=settings.voice.vad_required_start_frames,
+            shared_state=shared,  # For keyboard mode
         )
-        print("✅ Voice agent initialized")
+        print("✅ CRC Assistant initialized")
         print()
         
         # Print controls
         print("─" * 70)
         print("CONTROLS")
         print("─" * 70)
-        print("  Voice commands (speak naturally):")
-        print("    - 'Move left', 'Go up', 'Forward a little'")
+        print("  Voice commands (speak naturally to CRC Assistant):")
+        print("    - 'Move left', 'Go up a lot', 'Forward a little'")
+        print("    - 'Turn right' (rotates base), 'Turn the head left' (rotates camera)")
         print("    - 'Open the gripper', 'Close the gripper'")
-        print("    - 'Turn the head left', 'Look right'")
-        print("    - 'Track the cup', 'Follow the person'")
-        print("    - 'Stop tracking', 'Stop'")
-        print("    - 'Save this position as home'")
-        print("    - 'Go to home position'")
+        print("    - 'Track the cup', 'Follow the person', 'Stop tracking'")
+        print("    - 'Save this position as home', 'Go to home'")
+        print("    - 'What positions are saved?', 'Get status'")
+        print("    - 'Goodbye', 'Exit' (to quit the program)")
         print()
-        print("  Text commands (type in terminal):")
-        print("    /voice  - Switch to voice mode")
-        print("    /text   - Switch to text mode")
-        print("    /reset  - Reset conversation")
-        print("    /pause  - Pause voice listening")
-        print("    /resume - Resume voice listening")
-        print("    /quit   - Exit program")
+        print("  Slash commands (type in terminal):")
+        print("    /voice    - Voice control mode (speak to control)")
+        print("    /text     - Text control mode (type commands)")
+        print("    /keyboard - Keyboard control mode (arrow keys, etc.)")
+        print("    /reset    - Reset conversation history")
+        print("    /status   - Show robot status")
+        print("    /help     - Show detailed help")
+        print("    /quit     - Exit program")
         print()
-        print("  Keyboard (in YOLO window):")
-        print("    ESC     - Exit program")
+        print("  YOLO window:")
+        print("    ESC - Exit program")
         print()
         print("─" * 70)
         print()
-        print("🚀 Starting...")
+        print("🚀 Starting CRC Assistant...")
         print()
         
         # Start threads
@@ -727,8 +736,8 @@ def main():
         
         voice_runner.start()
         
-        print("🎤 Voice control active! Speak to control the robot.")
-        print("   (Type /text to switch to text mode)")
+        print("🎤 CRC Assistant is ready! Speak to control the robot.")
+        print("   (Type /help for all commands, /keyboard for keyboard mode)")
         print()
         
         # Main loop - handle stdin for text commands

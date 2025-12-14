@@ -22,11 +22,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# Constants for movement amounts
-AMOUNT_SMALL = 0.004  # "un_peu" - small step in meters
-AMOUNT_LARGE = 0.012  # "beaucoup" - large step in meters
-ROTATE_SMALL = 3.0    # "un_peu" - small rotation in degrees
-ROTATE_LARGE = 10.0   # "beaucoup" - large rotation in degrees
+# Default movement parameters (used when step_size is not provided)
+DEFAULT_LINEAR_STEP = 0.015  # 15mm default step
+DEFAULT_ROTATION_STEP = 10.0  # 10 degrees default step
 
 
 def inverse_kinematics_2d(x: float, y: float, l1: float = 0.1159, l2: float = 0.1350) -> Tuple[float, float]:
@@ -111,6 +109,9 @@ class RobotState:
     
     # Debouncing
     last_toggle_time: float = 0.0
+    
+    # Selected pose slot
+    selected_slot: str = "1"
 
 
 class RobotController:
@@ -169,25 +170,35 @@ class RobotController:
     # Movement Methods
     # -------------------------
     
-    def move_ee(self, axis: str, direction: str, amount: str) -> Dict[str, Any]:
+    def move_ee(self, axis: str, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None) -> Dict[str, Any]:
         """
         Move the end-effector along an axis.
         
         Args:
             axis: "x", "y", or "z" (x=left/right, y=up/down, z=forward/backward)
             direction: "positive" or "negative"
-            amount: "un_peu" (small) or "beaucoup" (large)
+            step_size: Step size in meters (0.005 to 0.05 typical). If provided, overrides amount.
+            amount: DEPRECATED - "un_peu" (small) or "beaucoup" (large). Use step_size instead.
         
         Returns:
             Dict with status and details
         """
         # Determine step size
-        if amount == "un_peu":
-            step = AMOUNT_SMALL
-        elif amount == "beaucoup":
-            step = AMOUNT_LARGE
+        if step_size is not None:
+            step = float(step_size)
+        elif amount is not None:
+            # Legacy support for amount strings (deprecated)
+            if amount == "un_peu":
+                step = 0.010  # 10mm
+            elif amount == "beaucoup":
+                step = 0.035  # 35mm
+            else:
+                step = DEFAULT_LINEAR_STEP
         else:
-            step = AMOUNT_SMALL
+            step = DEFAULT_LINEAR_STEP
+        
+        # Clamp step to reasonable bounds
+        step = max(0.001, min(0.05, step))
         
         # Apply direction
         if direction == "negative":
@@ -224,29 +235,39 @@ class RobotController:
                 "ok": True,
                 "axis": axis,
                 "direction": direction,
-                "amount": amount,
+                "step_mm": abs(step) * 1000,
                 "new_x": self.state.current_x,
                 "new_y": self.state.current_y,
             }
     
-    def head_turn(self, direction: str, amount: str) -> Dict[str, Any]:
+    def head_turn(self, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None) -> Dict[str, Any]:
         """
         Rotate the robot head/camera (shoulder_pan).
         
         Args:
             direction: "left" or "right"
-            amount: "un_peu" (small) or "beaucoup" (large)
+            step_size: Rotation in degrees (3 to 35 typical). If provided, overrides amount.
+            amount: DEPRECATED - "un_peu" (small) or "beaucoup" (large). Use step_size instead.
         
         Returns:
             Dict with status and details
         """
         # Determine rotation amount
-        if amount == "un_peu":
-            step = ROTATE_SMALL
-        elif amount == "beaucoup":
-            step = ROTATE_LARGE
+        if step_size is not None:
+            step = float(step_size)
+        elif amount is not None:
+            # Legacy support (deprecated)
+            if amount == "un_peu":
+                step = 8.0  # degrees
+            elif amount == "beaucoup":
+                step = 25.0  # degrees
+            else:
+                step = DEFAULT_ROTATION_STEP
         else:
-            step = ROTATE_SMALL
+            step = DEFAULT_ROTATION_STEP
+        
+        # Clamp step to reasonable bounds
+        step = max(1.0, min(45.0, step))
         
         # Apply direction (left = positive, right = negative for shoulder_pan)
         if direction == "right":
@@ -265,7 +286,7 @@ class RobotController:
             return {
                 "ok": True,
                 "direction": direction,
-                "amount": amount,
+                "step_deg": abs(step),
                 "new_pan_deg": new_pan,
             }
     
@@ -302,23 +323,33 @@ class RobotController:
                 "gripper_pos_deg": new_pos,
             }
     
-    def adjust_pitch(self, direction: str, amount: str) -> Dict[str, Any]:
+    def adjust_pitch(self, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None) -> Dict[str, Any]:
         """
         Adjust the wrist pitch (tilt).
         
         Args:
             direction: "up" or "down"
-            amount: "un_peu" (small) or "beaucoup" (large)
+            step_size: Adjustment in degrees (3 to 35 typical). If provided, overrides amount.
+            amount: DEPRECATED - "un_peu" (small) or "beaucoup" (large). Use step_size instead.
         
         Returns:
             Dict with status and details
         """
-        if amount == "un_peu":
-            step = 3.0
-        elif amount == "beaucoup":
-            step = 10.0
+        if step_size is not None:
+            step = float(step_size)
+        elif amount is not None:
+            # Legacy support (deprecated)
+            if amount == "un_peu":
+                step = 5.0
+            elif amount == "beaucoup":
+                step = 15.0
+            else:
+                step = DEFAULT_ROTATION_STEP
         else:
-            step = 3.0
+            step = DEFAULT_ROTATION_STEP
+        
+        # Clamp
+        step = max(1.0, min(30.0, step))
         
         if direction == "down":
             step = -step
@@ -333,27 +364,37 @@ class RobotController:
             return {
                 "ok": True,
                 "direction": direction,
-                "amount": amount,
+                "step_deg": abs(step),
                 "new_pitch_deg": self.state.pitch,
             }
     
-    def wrist_roll(self, direction: str, amount: str) -> Dict[str, Any]:
+    def wrist_roll(self, direction: str, step_size: Optional[float] = None, amount: Optional[str] = None) -> Dict[str, Any]:
         """
         Rotate the wrist roll joint.
         
         Args:
             direction: "left" or "right"
-            amount: "un_peu" or "beaucoup"
+            step_size: Rotation in degrees (3 to 35 typical). If provided, overrides amount.
+            amount: DEPRECATED - "un_peu" or "beaucoup". Use step_size instead.
         
         Returns:
             Dict with status
         """
-        if amount == "un_peu":
-            step = 5.0
-        elif amount == "beaucoup":
-            step = 15.0
+        if step_size is not None:
+            step = float(step_size)
+        elif amount is not None:
+            # Legacy support (deprecated)
+            if amount == "un_peu":
+                step = 8.0
+            elif amount == "beaucoup":
+                step = 20.0
+            else:
+                step = DEFAULT_ROTATION_STEP
         else:
-            step = 5.0
+            step = DEFAULT_ROTATION_STEP
+        
+        # Clamp
+        step = max(1.0, min(45.0, step))
         
         if direction == "left":
             step = -step
@@ -370,7 +411,7 @@ class RobotController:
             return {
                 "ok": True,
                 "direction": direction,
-                "amount": amount,
+                "step_deg": abs(step),
                 "new_wrist_roll_deg": new_val,
             }
     
@@ -562,7 +603,7 @@ class RobotController:
             return {
                 "ok": True,
                 "slot": slot,
-                "message": f"Pose saved to slot {slot}",
+                "message": f"Pose saved to slot '{slot}'",
             }
     
     def goto_pose(self, slot: str) -> Dict[str, Any]:
@@ -580,7 +621,8 @@ class RobotController:
             if pose is None:
                 return {
                     "ok": False,
-                    "error": f"No pose saved in slot {slot}",
+                    "error": f"No pose saved in slot '{slot}'",
+                    "available_slots": list(self.state.saved_poses.keys()),
                 }
             
             # Update target positions
@@ -608,7 +650,7 @@ class RobotController:
             return {
                 "ok": True,
                 "slot": slot,
-                "message": f"Moving to pose in slot {slot}",
+                "message": f"Moving to pose in slot '{slot}'",
             }
     
     # -------------------------
@@ -632,6 +674,7 @@ class RobotController:
                 "target_objects": self.state.target_objects,
                 "has_policy": self.policy is not None,
                 "saved_pose_slots": list(self.state.saved_poses.keys()),
+                "selected_slot": self.state.selected_slot,
             }
     
     def stop(self) -> Dict[str, Any]:

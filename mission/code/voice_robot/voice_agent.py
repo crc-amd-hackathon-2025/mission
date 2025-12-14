@@ -213,32 +213,55 @@ class RobotCommand:
 # Voice Robot Agent
 # -----------------------------
 
-SYSTEM_PROMPT = """Tu es un assistant vocal qui contrôle un bras robot SO101.
-Tu peux discuter de tout normalement, mais quand l'utilisateur demande une action physique du robot, tu dois appeler le tool approprié.
+SYSTEM_PROMPT = """You are CRC Assistant, a friendly and helpful voice assistant that controls a SO101 robot arm.
 
-Le robot peut effectuer les actions suivantes:
-- Déplacer l'effecteur (pince) selon les axes x (gauche/droite), y (haut/bas), z (avant/arrière)
-- Tourner la tête/caméra à gauche ou à droite
-- Ouvrir ou fermer la pince (gripper)
-- Ajuster l'inclinaison du poignet (pitch) vers le haut ou le bas
-- Tourner le poignet (wrist roll) à gauche ou à droite
-- Activer le suivi visuel (tracking) d'un objet (ex: "cup", "person", "bottle")
-- Désactiver le suivi visuel
-- Lancer une tâche pré-entraînée (ex: "grab_camera")
-- Sauvegarder la position actuelle dans un slot mémoire
-- Aller à une position sauvegardée
-- Obtenir le statut du robot
-- Arrêter tous les mouvements
+You have a cheerful personality and enjoy helping users interact with the robot. You can chat about anything, but when the user asks for a physical action, you call the appropriate tool.
 
-Conventions:
-- amount: "un_peu" (petit mouvement) ou "beaucoup" (grand mouvement)
-- axes EE: x=gauche/droite, y=haut/bas, z=avant/arrière
-- direction: "positive" ou "negative" pour les axes, "left"/"right" pour rotations
-- pince: "open" ou "close"
+## Robot Capabilities:
+- Move the end-effector (gripper) along x (left/right), y (up/down), z (forward/backward) axes
+- Rotate the robot base (shoulder_pan) left or right
+- Turn the head/camera left or right (also shoulder_pan but mentioned for head orientation)
+- Open or close the gripper
+- Adjust wrist pitch (tilt up/down)
+- Rotate the wrist (wrist roll) left or right
+- Enable visual tracking (YOLO) of an object (e.g., "cup", "person", "bottle")
+- Disable visual tracking
+- Save the current position to a memory slot
+- Go to a saved position
+- Get robot status
+- Stop all movements
+- Exit the program
 
-Si c'est ambigu, pose UNE question courte pour clarifier.
-Réponds toujours en français et de manière concise.
-Après chaque action, confirme brièvement ce que tu as fait."""
+## Movement Conventions:
+- `amount`: A float value between 0.0 and 1.0 where:
+  - 0.1 = very small movement (~5mm or ~3 degrees)
+  - 0.3 = small movement (~15mm or ~10 degrees)  
+  - 0.5 = medium movement (~25mm or ~15 degrees)
+  - 0.7 = large movement (~35mm or ~25 degrees)
+  - 1.0 = maximum movement (~50mm or ~35 degrees)
+- EE axes: x = left/right, y = up/down, z = forward/backward
+- direction: "positive" or "negative" for linear axes, "left" or "right" for rotations
+- gripper: "open" or "close"
+
+## IMPORTANT Behavior Rules:
+1. When the user says "turn right" or "turn left" WITHOUT specifying "head" or "camera", you should rotate the ROBOT BASE (move_ee on x axis). In your response, mention that if they want to turn the camera/head instead, they can say "turn the head".
+
+2. Always choose an appropriate `amount` value based on context:
+   - "a little" / "slightly" / "un peu" → 0.2 to 0.3
+   - Default (no qualifier) → 0.4 to 0.5
+   - "more" / "a lot" / "beaucoup" → 0.7 to 0.9
+   - "maximum" / "all the way" → 1.0
+
+3. If a request is ambiguous, ask ONE short clarifying question.
+
+4. After each action, briefly confirm what you did.
+
+5. Be friendly and conversational! You're CRC Assistant, and you enjoy your job.
+
+## Saved Positions:
+{saved_positions}
+
+Respond concisely and naturally. Feel free to add personality but stay helpful!"""
 
 
 class VoiceRobotAgent:
@@ -259,6 +282,7 @@ class VoiceRobotAgent:
         stt_model: str = "gpt-4o-transcribe",
         tts_model: str = "gpt-4o-mini-tts",
         tts_voice: str = "coral",
+        on_exit_request: Optional[Callable[[], None]] = None,
     ):
         """
         Initialize the voice agent.
@@ -269,6 +293,7 @@ class VoiceRobotAgent:
             stt_model: OpenAI model for speech-to-text
             tts_model: OpenAI model for text-to-speech
             tts_voice: Voice for TTS
+            on_exit_request: Callback when user requests program exit
         """
         self.client = OpenAI()
         self.robot = robot_controller
@@ -276,17 +301,27 @@ class VoiceRobotAgent:
         self.stt_model = stt_model
         self.tts_model = tts_model
         self.tts_voice = tts_voice
+        self.on_exit_request = on_exit_request
         
         self.tools = self._build_tools()
         self.input_list: List[Dict[str, Any]] = []
         self._seed_system()
     
+    def _get_saved_positions_info(self) -> str:
+        """Get information about saved positions for the system prompt."""
+        status = self.robot.get_status()
+        slots = status.get("saved_pose_slots", [])
+        if not slots:
+            return "No positions are currently saved."
+        return f"Available saved positions: {', '.join(slots)}"
+    
     def _seed_system(self):
         """Initialize the conversation with the system prompt."""
+        prompt = SYSTEM_PROMPT.format(saved_positions=self._get_saved_positions_info())
         self.input_list = [
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT,
+                "content": prompt,
             }
         ]
     
@@ -300,24 +335,25 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "move_ee",
-                "description": "Déplace l'effecteur (EE) du bras robot sur un axe. x=gauche/droite, y=haut/bas, z=avant/arrière.",
+                "description": "Move the end-effector (EE) of the robot arm along an axis. x=left/right, y=up/down, z=forward/backward. Use this for 'turn right/left' commands (without 'head' specification).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "axis": {
                             "type": "string",
                             "enum": ["x", "y", "z"],
-                            "description": "Axe de déplacement"
+                            "description": "Movement axis"
                         },
                         "direction": {
                             "type": "string",
                             "enum": ["positive", "negative"],
-                            "description": "Direction du mouvement"
+                            "description": "Movement direction. For x: positive=right, negative=left. For y: positive=up, negative=down. For z: positive=forward, negative=backward."
                         },
                         "amount": {
-                            "type": "string",
-                            "enum": ["un_peu", "beaucoup"],
-                            "description": "Amplitude du mouvement"
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Movement amount from 0.0 (tiny) to 1.0 (maximum). 0.3=small, 0.5=medium, 0.8=large."
                         },
                     },
                     "required": ["axis", "direction", "amount"],
@@ -326,19 +362,20 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "head_turn",
-                "description": "Tourne la tête/caméra du robot à gauche ou à droite (rotation du shoulder_pan).",
+                "description": "Turn the robot's head/camera left or right (shoulder_pan rotation). Use this specifically when user mentions 'head' or 'camera'.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "direction": {
                             "type": "string",
                             "enum": ["left", "right"],
-                            "description": "Direction de rotation"
+                            "description": "Rotation direction"
                         },
                         "amount": {
-                            "type": "string",
-                            "enum": ["un_peu", "beaucoup"],
-                            "description": "Amplitude de rotation"
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Rotation amount from 0.0 (tiny) to 1.0 (maximum). 0.3=small, 0.5=medium, 0.8=large."
                         },
                     },
                     "required": ["direction", "amount"],
@@ -347,14 +384,14 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "gripper",
-                "description": "Ouvre ou ferme la pince du robot.",
+                "description": "Open or close the robot gripper.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
                             "enum": ["open", "close"],
-                            "description": "Action à effectuer"
+                            "description": "Action to perform"
                         }
                     },
                     "required": ["action"],
@@ -363,19 +400,20 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "adjust_pitch",
-                "description": "Ajuste l'inclinaison du poignet (pitch) vers le haut ou le bas.",
+                "description": "Adjust the wrist pitch (tilt) up or down.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "direction": {
                             "type": "string",
                             "enum": ["up", "down"],
-                            "description": "Direction de l'inclinaison"
+                            "description": "Tilt direction"
                         },
                         "amount": {
-                            "type": "string",
-                            "enum": ["un_peu", "beaucoup"],
-                            "description": "Amplitude"
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Adjustment amount from 0.0 to 1.0"
                         },
                     },
                     "required": ["direction", "amount"],
@@ -384,19 +422,20 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "wrist_roll",
-                "description": "Effectue une rotation du poignet (wrist roll) à gauche ou à droite.",
+                "description": "Rotate the wrist (roll) left or right.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "direction": {
                             "type": "string",
                             "enum": ["left", "right"],
-                            "description": "Direction de rotation"
+                            "description": "Rotation direction"
                         },
                         "amount": {
-                            "type": "string",
-                            "enum": ["un_peu", "beaucoup"],
-                            "description": "Amplitude"
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Rotation amount from 0.0 to 1.0"
                         },
                     },
                     "required": ["direction", "amount"],
@@ -405,13 +444,13 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "start_tracking",
-                "description": "Active le suivi visuel (YOLO tracking) d'un objet. Le robot suivra l'objet avec la caméra.",
+                "description": "Enable visual tracking (YOLO) of an object. The robot will follow the object with the camera.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "object_name": {
                             "type": "string",
-                            "description": "Nom de l'objet à suivre (ex: cup, person, bottle, cell phone)"
+                            "description": "Name of the object to track (e.g., cup, person, bottle, cell phone)"
                         }
                     },
                     "required": ["object_name"],
@@ -420,7 +459,7 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "stop_tracking",
-                "description": "Désactive le suivi visuel. Le robot arrête de suivre l'objet.",
+                "description": "Disable visual tracking. The robot stops following the object.",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -428,29 +467,14 @@ class VoiceRobotAgent:
             },
             {
                 "type": "function",
-                "name": "start_task",
-                "description": "Lance une tâche pré-entraînée par l'IA (policy inference). Ex: grab_camera pour attraper la caméra.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_name": {
-                            "type": "string",
-                            "description": "Nom de la tâche (ex: grab_camera)"
-                        }
-                    },
-                    "required": ["task_name"],
-                },
-            },
-            {
-                "type": "function",
                 "name": "save_pose",
-                "description": "Sauvegarde la position actuelle du robot dans un slot mémoire (0-9 ou nom).",
+                "description": "Save the current robot position to a memory slot (0-9 or a name like 'home').",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "slot": {
                             "type": "string",
-                            "description": "Numéro ou nom du slot (ex: '1', 'home')"
+                            "description": "Slot number or name (e.g., '1', 'home', 'grab_position')"
                         }
                     },
                     "required": ["slot"],
@@ -459,13 +483,13 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "goto_pose",
-                "description": "Va à une position précédemment sauvegardée.",
+                "description": "Move to a previously saved position.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "slot": {
                             "type": "string",
-                            "description": "Numéro ou nom du slot"
+                            "description": "Slot number or name"
                         }
                     },
                     "required": ["slot"],
@@ -473,8 +497,17 @@ class VoiceRobotAgent:
             },
             {
                 "type": "function",
+                "name": "list_saved_poses",
+                "description": "Get the list of all saved positions/poses.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "type": "function",
                 "name": "get_status",
-                "description": "Obtient le statut actuel du robot (position, tracking, etc.).",
+                "description": "Get the current status of the robot (position, tracking state, etc.).",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -483,7 +516,16 @@ class VoiceRobotAgent:
             {
                 "type": "function",
                 "name": "stop",
-                "description": "Arrête tous les mouvements du robot (urgence ou pause).",
+                "description": "Stop all robot movements (emergency stop or pause).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "type": "function",
+                "name": "exit_program",
+                "description": "Exit the voice control program and shut down the robot. Use when user says 'quit', 'exit', 'goodbye', 'shut down', etc.",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -527,7 +569,7 @@ class VoiceRobotAgent:
             voice=self.tts_voice,
             input=text,
             response_format="wav",
-            instructions="Voix naturelle, claire, en français.",
+            instructions="Natural, clear, friendly voice. Speak in the same language as the input text.",
         ) as response:
             response.stream_to_file(out_path)
         return out_path
@@ -545,48 +587,85 @@ class VoiceRobotAgent:
         """
         args = json.loads(arguments_json) if arguments_json else {}
         
+        # Convert float amount to appropriate step size
+        def get_linear_step(amount: float) -> float:
+            """Convert 0-1 amount to meters (0.005 to 0.05m)."""
+            return 0.005 + amount * 0.045  # 5mm to 50mm
+        
+        def get_rotation_step(amount: float) -> float:
+            """Convert 0-1 amount to degrees (3 to 35 degrees)."""
+            return 3.0 + amount * 32.0  # 3° to 35°
+        
         # Map tool names to RobotController methods
-        tool_handlers = {
-            "move_ee": lambda: self.robot.move_ee(
+        if name == "move_ee":
+            amount = float(args.get("amount", 0.5))
+            step = get_linear_step(amount)
+            return self.robot.move_ee(
                 axis=args["axis"],
                 direction=args["direction"],
-                amount=args["amount"]
-            ),
-            "head_turn": lambda: self.robot.head_turn(
-                direction=args["direction"],
-                amount=args["amount"]
-            ),
-            "gripper": lambda: self.robot.gripper(action=args["action"]),
-            "adjust_pitch": lambda: self.robot.adjust_pitch(
-                direction=args["direction"],
-                amount=args["amount"]
-            ),
-            "wrist_roll": lambda: self.robot.wrist_roll(
-                direction=args["direction"],
-                amount=args["amount"]
-            ),
-            "start_tracking": lambda: self.robot.start_tracking(
-                object_name=args["object_name"]
-            ),
-            "stop_tracking": lambda: self.robot.stop_tracking(),
-            "start_task": lambda: self.robot.start_task(task_name=args["task_name"]),
-            "save_pose": lambda: self.robot.save_pose(slot=args["slot"]),
-            "goto_pose": lambda: self.robot.goto_pose(slot=args["slot"]),
-            "get_status": lambda: self.robot.get_status(),
-            "stop": lambda: self.robot.stop(),
-        }
+                step_size=step
+            )
         
-        handler = tool_handlers.get(name)
-        if handler:
-            try:
-                result = handler()
-                print(f"[TOOL] {name} -> {result}")
-                return result
-            except Exception as e:
-                print(f"[TOOL ERROR] {name}: {e}")
-                return {"ok": False, "error": str(e)}
+        elif name == "head_turn":
+            amount = float(args.get("amount", 0.5))
+            step = get_rotation_step(amount)
+            return self.robot.head_turn(
+                direction=args["direction"],
+                step_size=step
+            )
         
-        return {"ok": False, "error": f"Unknown tool: {name}"}
+        elif name == "gripper":
+            return self.robot.gripper(action=args["action"])
+        
+        elif name == "adjust_pitch":
+            amount = float(args.get("amount", 0.5))
+            step = get_rotation_step(amount)
+            return self.robot.adjust_pitch(
+                direction=args["direction"],
+                step_size=step
+            )
+        
+        elif name == "wrist_roll":
+            amount = float(args.get("amount", 0.5))
+            step = get_rotation_step(amount)
+            return self.robot.wrist_roll(
+                direction=args["direction"],
+                step_size=step
+            )
+        
+        elif name == "start_tracking":
+            return self.robot.start_tracking(object_name=args["object_name"])
+        
+        elif name == "stop_tracking":
+            return self.robot.stop_tracking()
+        
+        elif name == "save_pose":
+            return self.robot.save_pose(slot=args["slot"])
+        
+        elif name == "goto_pose":
+            return self.robot.goto_pose(slot=args["slot"])
+        
+        elif name == "list_saved_poses":
+            status = self.robot.get_status()
+            slots = status.get("saved_pose_slots", [])
+            if slots:
+                return {"ok": True, "saved_poses": slots, "message": f"Saved positions: {', '.join(slots)}"}
+            else:
+                return {"ok": True, "saved_poses": [], "message": "No positions are currently saved."}
+        
+        elif name == "get_status":
+            return self.robot.get_status()
+        
+        elif name == "stop":
+            return self.robot.stop()
+        
+        elif name == "exit_program":
+            if self.on_exit_request:
+                self.on_exit_request()
+            return {"ok": True, "message": "Exiting program..."}
+        
+        else:
+            return {"ok": False, "error": f"Unknown tool: {name}"}
     
     def agent_step(self, user_text: str) -> Tuple[str, List[RobotCommand]]:
         """
@@ -599,6 +678,12 @@ class VoiceRobotAgent:
             Tuple of (response_text, list_of_robot_commands)
         """
         robot_cmds: List[RobotCommand] = []
+        
+        # Update system prompt with current saved positions
+        self.input_list[0]["content"] = SYSTEM_PROMPT.format(
+            saved_positions=self._get_saved_positions_info()
+        )
+        
         self.input_list.append({"role": "user", "content": user_text})
         
         # First API call - may result in tool calls
@@ -619,6 +704,8 @@ class VoiceRobotAgent:
                 robot_cmds.append(RobotCommand(name=tool_name, args=json.loads(tool_args) if tool_args else {}))
                 
                 tool_result = self._dispatch_tool(tool_name, tool_args)
+                print(f"[TOOL] {tool_name} -> {tool_result}")
+                
                 self.input_list.append(
                     {
                         "type": "function_call_output",
@@ -654,6 +741,7 @@ class VoiceLoopRunner:
     - Speech-to-text
     - Agent processing
     - Text-to-speech playback
+    - Keyboard control mode
     """
     
     def __init__(
@@ -668,6 +756,8 @@ class VoiceLoopRunner:
         vad_max_record_s: float = 15.0,
         vad_required_start_frames: int = 3,
         tmp_dir: Optional[Path] = None,
+        keyboard_controller: Optional[Any] = None,
+        shared_state: Optional[Any] = None,
     ):
         """
         Initialize the voice loop runner.
@@ -683,6 +773,8 @@ class VoiceLoopRunner:
             vad_max_record_s: Maximum recording duration
             vad_required_start_frames: Frames above threshold to start
             tmp_dir: Directory for temporary audio files
+            keyboard_controller: Optional keyboard controller for keyboard mode
+            shared_state: Optional shared state for keyboard mode
         """
         self.agent = agent
         self.sample_rate = sample_rate
@@ -703,7 +795,12 @@ class VoiceLoopRunner:
         
         # Command queue for text input mode
         self.cmd_queue: "queue.Queue[str]" = queue.Queue()
-        self.mode = "voice"  # "voice" or "text"
+        self.mode = "voice"  # "voice", "text", or "keyboard"
+        
+        # Keyboard mode components
+        self.keyboard_controller = keyboard_controller
+        self.shared_state = shared_state
+        self.keyboard_thread: Optional[threading.Thread] = None
         
         # Callbacks
         self.on_listening: Optional[Callable[[], None]] = None
@@ -735,6 +832,11 @@ class VoiceLoopRunner:
                     self._handle_command(cmd)
                 elif self.mode == "text":
                     self._process_text_input(cmd)
+            
+            # Keyboard mode: don't process voice, just wait
+            if self.mode == "keyboard":
+                time.sleep(0.1)
+                continue
             
             # Voice mode: listen for speech
             if self.mode == "voice" and not self.paused.is_set():
@@ -777,25 +879,248 @@ class VoiceLoopRunner:
         """Handle slash commands."""
         cmd_lower = cmd.lower()
         
-        if cmd_lower == "/quit":
+        if cmd_lower == "/quit" or cmd_lower == "/exit":
             self.stop()
         elif cmd_lower == "/reset":
             self.agent.reset_conversation()
             print("[SYS] Conversation reset.")
         elif cmd_lower == "/text":
             self.mode = "text"
-            print("[SYS] Text mode activated.")
+            self._stop_keyboard_mode()
+            print("[SYS] Text mode activated. Type your commands.")
         elif cmd_lower == "/voice":
             self.mode = "voice"
-            print("[SYS] Voice mode activated.")
+            self._stop_keyboard_mode()
+            print("[SYS] Voice mode activated. Speak to control the robot.")
+        elif cmd_lower == "/keyboard":
+            self._start_keyboard_mode()
         elif cmd_lower == "/pause":
             self.paused.set()
             print("[SYS] Voice loop paused.")
         elif cmd_lower == "/resume":
             self.paused.clear()
             print("[SYS] Voice loop resumed.")
+        elif cmd_lower == "/status":
+            status = self.agent.robot.get_status()
+            print(f"[STATUS] Mode: {self.mode}")
+            print(f"[STATUS] Robot: {json.dumps(status, indent=2)}")
+        elif cmd_lower == "/help":
+            self._print_help()
         else:
             print(f"[SYS] Unknown command: {cmd}")
+            print("[SYS] Type /help for available commands.")
+    
+    def _print_help(self):
+        """Print help information."""
+        print("""
+╔══════════════════════════════════════════════════════════════════════╗
+║                         CRC ASSISTANT - HELP                         ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  MODES:                                                              ║
+║    /voice    - Voice control mode (speak to control)                 ║
+║    /text     - Text control mode (type commands)                     ║
+║    /keyboard - Keyboard control mode (use keys directly)             ║
+║                                                                      ║
+║  COMMANDS:                                                           ║
+║    /reset    - Reset conversation history                            ║
+║    /pause    - Pause voice listening                                 ║
+║    /resume   - Resume voice listening                                ║
+║    /status   - Show current robot status                             ║
+║    /help     - Show this help                                        ║
+║    /quit     - Exit the program                                      ║
+║                                                                      ║
+║  KEYBOARD MODE CONTROLS:                                             ║
+║    Arrow keys    - Move end-effector (left/right/up/down)            ║
+║    a/d           - Rotate base left/right                            ║
+║    t/g           - Wrist roll left/right                             ║
+║    y/h           - Gripper close/open                                ║
+║    r/f           - Pitch up/down                                     ║
+║    0-9           - Select memory slot                                ║
+║    o             - Save current pose to slot                         ║
+║    i             - Go to saved pose in slot                          ║
+║    p             - Toggle YOLO tracking                              ║
+║    ESC           - Return to voice mode                              ║
+╚══════════════════════════════════════════════════════════════════════╝
+""")
+    
+    def _start_keyboard_mode(self):
+        """Start keyboard control mode."""
+        if self.shared_state is None:
+            print("[SYS] Keyboard mode not available (no shared state).")
+            return
+        
+        self.mode = "keyboard"
+        print()
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║                      KEYBOARD CONTROL MODE                           ║")
+        print("╠══════════════════════════════════════════════════════════════════════╣")
+        print("║  Arrow keys: Move EE (left/right/up/down)                            ║")
+        print("║  a/d: Base rotation    t/g: Wrist roll    y/h: Gripper               ║")
+        print("║  r/f: Pitch            0-9: Select slot   o: Save   i: Go to         ║")
+        print("║  p: Toggle tracking    ESC: Return to voice mode                     ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        print()
+        print("[KEYBOARD] Use keyboard to control. Press ESC to return to voice mode.")
+        
+        # Start keyboard handling thread
+        self.keyboard_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+        self.keyboard_thread.start()
+    
+    def _stop_keyboard_mode(self):
+        """Stop keyboard control mode."""
+        if self.keyboard_thread and self.keyboard_thread.is_alive():
+            # The thread will exit when mode changes
+            pass
+    
+    def _keyboard_loop(self):
+        """Handle keyboard input in keyboard mode."""
+        try:
+            from pynput import keyboard
+            
+            # Key state tracking
+            pressed_keys = set()
+            last_action_time = {}
+            action_interval = 0.05  # 50ms between repeated actions
+            
+            def on_press(key):
+                if self.mode != "keyboard":
+                    return False  # Stop listener
+                
+                try:
+                    k = key.char if hasattr(key, 'char') and key.char else str(key)
+                except:
+                    k = str(key)
+                
+                pressed_keys.add(k)
+                
+                # ESC to exit keyboard mode
+                if k in ['Key.esc', 'esc', 'ESC']:
+                    self.mode = "voice"
+                    print("[SYS] Returning to voice mode...")
+                    return False
+                
+                return True
+            
+            def on_release(key):
+                if self.mode != "keyboard":
+                    return False
+                
+                try:
+                    k = key.char if hasattr(key, 'char') and key.char else str(key)
+                except:
+                    k = str(key)
+                
+                pressed_keys.discard(k)
+                return True
+            
+            listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            listener.start()
+            
+            # Movement parameters
+            ee_step = 0.008  # 8mm per action
+            rotation_step = 3.0  # 3 degrees per action
+            
+            while self.mode == "keyboard" and not self.stop_event.is_set():
+                current_time = time.time()
+                
+                for k in list(pressed_keys):
+                    # Check if enough time has passed for this key
+                    if k in last_action_time and current_time - last_action_time[k] < action_interval:
+                        continue
+                    
+                    action_performed = False
+                    
+                    # Arrow keys for EE movement
+                    if k in ['Key.left', 'left', 's']:
+                        self.agent.robot.move_ee(axis="x", direction="negative", step_size=ee_step)
+                        action_performed = True
+                    elif k in ['Key.right', 'right', 'w']:
+                        self.agent.robot.move_ee(axis="x", direction="positive", step_size=ee_step)
+                        action_performed = True
+                    elif k in ['Key.up', 'up', 'q']:
+                        self.agent.robot.move_ee(axis="y", direction="positive", step_size=ee_step)
+                        action_performed = True
+                    elif k in ['Key.down', 'down', 'e']:
+                        self.agent.robot.move_ee(axis="y", direction="negative", step_size=ee_step)
+                        action_performed = True
+                    
+                    # Base rotation
+                    elif k == 'a':
+                        self.agent.robot.head_turn(direction="left", step_size=rotation_step)
+                        action_performed = True
+                    elif k == 'd':
+                        self.agent.robot.head_turn(direction="right", step_size=rotation_step)
+                        action_performed = True
+                    
+                    # Wrist roll
+                    elif k == 't':
+                        self.agent.robot.wrist_roll(direction="left", step_size=rotation_step)
+                        action_performed = True
+                    elif k == 'g':
+                        self.agent.robot.wrist_roll(direction="right", step_size=rotation_step)
+                        action_performed = True
+                    
+                    # Gripper
+                    elif k == 'y':
+                        self.agent.robot.gripper(action="close")
+                        action_performed = True
+                        pressed_keys.discard(k)  # One-shot
+                    elif k == 'h':
+                        self.agent.robot.gripper(action="open")
+                        action_performed = True
+                        pressed_keys.discard(k)  # One-shot
+                    
+                    # Pitch
+                    elif k == 'r':
+                        self.agent.robot.adjust_pitch(direction="up", step_size=rotation_step)
+                        action_performed = True
+                    elif k == 'f':
+                        self.agent.robot.adjust_pitch(direction="down", step_size=rotation_step)
+                        action_performed = True
+                    
+                    # Toggle tracking
+                    elif k == 'p':
+                        self.agent.robot.toggle_tracking()
+                        print("[KEYBOARD] Tracking toggled")
+                        action_performed = True
+                        pressed_keys.discard(k)  # One-shot
+                    
+                    # Slot selection (0-9)
+                    elif len(k) == 1 and k.isdigit():
+                        with self.shared_state.lock:
+                            self.shared_state.selected_slot = k
+                        print(f"[KEYBOARD] Selected slot: {k}")
+                        pressed_keys.discard(k)  # One-shot
+                    
+                    # Save pose
+                    elif k == 'o':
+                        if hasattr(self.shared_state, 'selected_slot'):
+                            slot = self.shared_state.selected_slot
+                            result = self.agent.robot.save_pose(slot=slot)
+                            print(f"[KEYBOARD] {result.get('message', 'Pose saved')}")
+                        pressed_keys.discard(k)  # One-shot
+                    
+                    # Go to pose
+                    elif k == 'i':
+                        if hasattr(self.shared_state, 'selected_slot'):
+                            slot = self.shared_state.selected_slot
+                            result = self.agent.robot.goto_pose(slot=slot)
+                            print(f"[KEYBOARD] {result.get('message', 'Moving to pose')}")
+                        pressed_keys.discard(k)  # One-shot
+                    
+                    if action_performed:
+                        last_action_time[k] = current_time
+                
+                time.sleep(0.01)
+            
+            listener.stop()
+            
+        except ImportError:
+            print("[SYS] Keyboard mode requires 'pynput' package. Install with: pip install pynput")
+            self.mode = "voice"
+        except Exception as e:
+            print(f"[SYS] Keyboard mode error: {e}")
+            self.mode = "voice"
     
     def _process_text_input(self, text: str):
         """Process text input in text mode."""
@@ -808,7 +1133,7 @@ class VoiceLoopRunner:
             self.on_processing()
         
         answer, commands = self.agent.agent_step(user_text)
-        print(f"[AGENT] {answer}")
+        print(f"[CRC ASSISTANT] {answer}")
         
         if self.on_speaking:
             self.on_speaking()
