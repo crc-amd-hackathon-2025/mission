@@ -1,2 +1,3 @@
-# Link to the wandb url where the experiment is stored
+# Link to the W&B Dashboard (public project)
+
 https://wandb.ai/amdhack-crc/lerobot
