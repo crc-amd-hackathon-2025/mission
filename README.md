@@ -34,7 +34,7 @@ Real world application: Content creation assistance (see summary above for detai
 - *Flexibility and adaptability of the solution*: The voice command interface allows users to easily switch targets.
 - *Types of commands or interfaces needed to control the robot*: Voice commands.
 
-Besides, the YOLO-based tracking system requires an additional calibrations: we implemented an automatic calibration tool. The results are stored in a JSON configuration file that can easily be shared and is automatically loaded at restart. 
+Besides, the YOLO (which is trained on the COCO dataset) is used as a tracking system, and it requires an additional calibration: we implemented an automatic calibration tool. The results are stored in a JSON configuration file that can easily be shared and is automatically loaded at restart. 
 
 ## Additional Links
 *For example, you can provide links to:*
