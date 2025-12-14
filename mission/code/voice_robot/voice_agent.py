@@ -929,16 +929,13 @@ class VoiceLoopRunner:
 ║    /quit     - Exit the program                                      ║
 ║                                                                      ║
 ║  KEYBOARD MODE CONTROLS:                                             ║
-║    Arrow keys    - Move end-effector (left/right/up/down)            ║
-║    a/d           - Rotate base left/right                            ║
-║    t/g           - Wrist roll left/right                             ║
-║    y/h           - Gripper close/open                                ║
-║    r/f           - Pitch up/down                                     ║
-║    0-9           - Select memory slot                                ║
-║    o             - Save current pose to slot                         ║
-║    i             - Go to saved pose in slot                          ║
-║    p             - Toggle YOLO tracking                              ║
-║    ESC           - Return to voice mode                              ║
+║    Arrow Left/Right (or A/D): Rotate Base (Turn)                     ║
+║    Arrow Up/Down (or W/S):    Move Forward/Backward (Reach)          ║
+║    PageUp/Down (or R/F):      Move Up/Down (Height)                  ║
+║    t/g: Wrist roll            y/h: Gripper open/close                ║
+║    u/j: Pitch up/down         0-9: Select slot                       ║
+║    o: Save pose               i: Go to pose                          ║
+║    p: Toggle tracking         ESC: Return to voice mode              ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """)
     
@@ -953,9 +950,11 @@ class VoiceLoopRunner:
         print("╔══════════════════════════════════════════════════════════════════════╗")
         print("║                      KEYBOARD CONTROL MODE                           ║")
         print("╠══════════════════════════════════════════════════════════════════════╣")
-        print("║  Arrow keys: Move EE (left/right/up/down)                            ║")
-        print("║  a/d: Base rotation    t/g: Wrist roll    y/h: Gripper               ║")
-        print("║  r/f: Pitch            0-9: Select slot   o: Save   i: Go to         ║")
+        print("║  Arrow Left/Right (or A/D): Rotate Base (Turn)                       ║")
+        print("║  Arrow Up/Down (or W/S):    Move Forward/Backward (Reach)            ║")
+        print("║  PageUp/Down (or R/F):      Move Up/Down (Height)                    ║")
+        print("║  t/g: Wrist roll       y/h: Gripper open/close                       ║")
+        print("║  u/j: Pitch up/down    0-9: Select slot   o: Save   i: Go to         ║")
         print("║  p: Toggle tracking    ESC: Return to voice mode                     ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
         print()
@@ -1029,26 +1028,30 @@ class VoiceLoopRunner:
                     
                     action_performed = False
                     
-                    # Arrow keys for EE movement
-                    if k in ['Key.left', 'left', 's']:
-                        self.agent.robot.move_ee(axis="x", direction="negative", step_size=ee_step)
-                        action_performed = True
-                    elif k in ['Key.right', 'right', 'w']:
-                        self.agent.robot.move_ee(axis="x", direction="positive", step_size=ee_step)
-                        action_performed = True
-                    elif k in ['Key.up', 'up', 'q']:
-                        self.agent.robot.move_ee(axis="y", direction="positive", step_size=ee_step)
-                        action_performed = True
-                    elif k in ['Key.down', 'down', 'e']:
-                        self.agent.robot.move_ee(axis="y", direction="negative", step_size=ee_step)
-                        action_performed = True
+                    # Arrow keys & WASD for Navigation
                     
-                    # Base rotation
-                    elif k == 'a':
+                    # Left/Right = Rotation (Base)
+                    if k in ['Key.left', 'left', 'a']:
                         self.agent.robot.head_turn(direction="left", step_size=rotation_step)
                         action_performed = True
-                    elif k == 'd':
+                    elif k in ['Key.right', 'right', 'd']:
                         self.agent.robot.head_turn(direction="right", step_size=rotation_step)
+                        action_performed = True
+                    
+                    # Up/Down = Forward/Backward (Reach - X axis)
+                    elif k in ['Key.up', 'up', 'w']:
+                        self.agent.robot.move_ee(axis="x", direction="positive", step_size=ee_step)
+                        action_performed = True
+                    elif k in ['Key.down', 'down', 's']:
+                        self.agent.robot.move_ee(axis="x", direction="negative", step_size=ee_step)
+                        action_performed = True
+                    
+                    # PageUp/Down & R/F = Up/Down (Height - Y axis)
+                    elif k in ['Key.page_up', 'page_up', 'r']:
+                        self.agent.robot.move_ee(axis="y", direction="positive", step_size=ee_step)
+                        action_performed = True
+                    elif k in ['Key.page_down', 'page_down', 'f']:
+                        self.agent.robot.move_ee(axis="y", direction="negative", step_size=ee_step)
                         action_performed = True
                     
                     # Wrist roll
@@ -1069,11 +1072,11 @@ class VoiceLoopRunner:
                         action_performed = True
                         pressed_keys.discard(k)  # One-shot
                     
-                    # Pitch
-                    elif k == 'r':
+                    # Pitch (u/j)
+                    elif k == 'u':
                         self.agent.robot.adjust_pitch(direction="up", step_size=rotation_step)
                         action_performed = True
-                    elif k == 'f':
+                    elif k == 'j':
                         self.agent.robot.adjust_pitch(direction="down", step_size=rotation_step)
                         action_performed = True
                     
