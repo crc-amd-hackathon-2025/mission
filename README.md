@@ -14,8 +14,6 @@
 
 Our work focuses on developing a robotic system that can assist content creators in recording videos: the robot is capable of grabbing a camera, then pointing it towards a specific target (*e.g.*, a person), focusing on it while maintaining a stable shot, and following the target as it moves. Moreover, the robot is controlled through voice commands, allowing for a hands-free experience. This system aims to enhance the content creation process by providing dynamic and adaptive camera work, enabling creators to focus on their performance without worrying about camera operation.
 
-**TODO**: Images or video demonstrating your project
-
 ## Submission Details
 
 ### 1. Mission Description
